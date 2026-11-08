@@ -16,6 +16,7 @@ logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("MAX_TOKEN")
 WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET")
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 
 if not TOKEN or not WEBHOOK_SECRET:
     raise RuntimeError("Не заданы MAX_TOKEN или MAX_WEBHOOK_SECRET")
