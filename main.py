@@ -135,6 +135,13 @@ def send_message(user_id, text, buttons=None):
     response.raise_for_status()
 
 
+def notify_admin(text):
+    if not ADMIN_USER_ID:
+        logging.error("Не задан ADMIN_USER_ID")
+        return
+
+    send_message(ADMIN_USER_ID, text)
+    
 def keyboard(items, columns=2):
     rows = []
     for i in range(0, len(items), columns):
