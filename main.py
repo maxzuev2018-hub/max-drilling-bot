@@ -2,7 +2,8 @@ import os
 import time
 import logging
 import requests
-
+import certifi
+os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("MAX_TOKEN")
