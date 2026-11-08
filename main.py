@@ -479,6 +479,7 @@ def handle_update(update):
         message = update.get("message", {})
         sender = message.get("sender", {})
         user_id = sender.get("user_id")
+        logging.info("ID пользователя MAX: %s", user_id)
         text = message.get("body", {}).get("text", "")
 
         if not user_id:
