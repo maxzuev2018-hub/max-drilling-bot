@@ -71,6 +71,7 @@ app = Flask(__name__)
 
 # Временные данные расчётов пользователей
 calculations = {}
+lead_states = {}
 
 # Тарифы: рубли за 1 см
 DIAMETERS = {
@@ -308,7 +309,9 @@ def calculate(user_id):
     for key in data["extras"]:
         name, price = EXTRAS[key]
         if price is None:
-            extra_lines.append(f"{name}: стоимость согласуется с менеджером")
+            extra_lines.append(
+                f"{name}: стоимость согласуется с менеджером"
+            )
         else:
             extra_total += price
             extra_lines.append(f"{name}: {price} ₽")
@@ -344,20 +347,29 @@ def calculate(user_id):
     if "waste" in data["extras"]:
         result += "\nВывоз мусора оплачивается отдельно по договорённости."
 
+    data["result"] = result
+
     send_message(
         user_id,
-        result,
+        result + "\n\nХотите оставить заявку?",
         [
+            [{"type": "callback", "text": "📩 Оставить заявку", "payload": "lead_start"}],
             [{"type": "callback", "text": "🔄 Новый расчёт", "payload": "price"}],
             [{"type": "callback", "text": "🏠 Главное меню", "payload": "menu"}],
         ]
     )
 
-    calculations.pop(str(user_id), None)
-
 
 def handle_button(user_id, payload):
     uid = str(user_id)
+    if payload == "lead_start":
+        if uid not in calculations or "result" not in calculations[uid]:
+            send_message(user_id, "Сначала выполните расчёт стоимости.")
+            return
+
+        lead_states[uid] = {"step": "name"}
+        send_message(user_id, "Как вас зовут?")
+        return
 
     if payload == "menu":
         main_menu(user_id)
@@ -495,7 +507,59 @@ def handle_update(update):
 
         uid = str(user_id)
 
-        if uid in calculations and "depth" not in calculations[uid]:
+        if uid in lead_states:
+            state = lead_states[uid]
+
+            if state["step"] == "name":
+                state["name"] = text.strip()
+
+                if len(state["name"]) < 2:
+                    send_message(user_id, "Пожалуйста, введите имя.")
+                    return
+
+                state["step"] = "phone"
+                send_message(
+                    user_id,
+                    "📞 Теперь отправьте номер телефона.\n"
+                    "Например: +79991234567"
+                )
+                return
+
+            elif state["step"] == "phone":
+                phone = text.strip()
+                digits = "".join(filter(str.isdigit, phone))
+
+                if len(digits) < 10:
+                    send_message(
+                        user_id,
+                        "Пожалуйста, введите корректный номер телефона."
+                    )
+                    return
+
+                data = calculations.get(uid, {})
+                result = data.get("result", "Расчёт не найден.")
+
+                admin_message = (
+                    "📩 НОВАЯ ЗАЯВКА!\n\n"
+                    f"Имя: {state['name']}\n"
+                    f"Телефон: {phone}\n"
+                    f"ID клиента MAX: {user_id}\n\n"
+                    f"{result}"
+                )
+
+                notify_admin(admin_message)
+
+                send_message(
+                    user_id,
+                    "✅ Спасибо! Ваша заявка отправлена.\n"
+                    "Мы свяжемся с вами в ближайшее время."
+                )
+
+                lead_states.pop(uid, None)
+                calculations.pop(uid, None)
+                return
+
+        elif uid in calculations and "depth" not in calculations[uid]:
             try:
                 depth = float(text.replace(",", ".").strip())
                 if depth <= 0 or depth > 10000:
