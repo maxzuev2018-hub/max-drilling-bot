@@ -1,25 +1,46 @@
 import os
+import re
 import time
-import logging
 import ssl
+import hmac
 import hashlib
+import logging
+import threading
 from pathlib import Path
 
 import requests
+from flask import Flask, request, jsonify
 from requests.adapters import HTTPAdapter
 
 logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("MAX_TOKEN")
+WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET")
 
 if not TOKEN:
-    raise RuntimeError("Не задан MAX_TOKEN в переменных Bothost")
+    raise RuntimeError("Не задан MAX_TOKEN в Bothost")
+
+if not WEBHOOK_SECRET:
+    raise RuntimeError("Не задан MAX_WEBHOOK_SECRET в Bothost")
+
+if not re.fullmatch(r"[A-Za-z0-9_-]{5,256}", WEBHOOK_SECRET):
+    raise RuntimeError(
+        "Секрет содержит недопустимые символы. "
+        "Используйте латинские буквы, цифры, _ и -"
+    )
 
 API_URL = "https://platform-api2.max.ru"
 HEADERS = {"Authorization": TOKEN}
 
+WEBHOOK_URL = (
+    "https://bot-1794067708-7548-maksim-z.bothost.tech/webhook"
+)
+
 # Проверка сертификата MAX
-CA_FILE = Path(__file__).resolve().parent / "russian_trusted_sub_ca_2024.pem"
+CA_FILE = (
+    Path(__file__).resolve().parent
+    / "russian_trusted_sub_ca_2024.pem"
+)
 
 EXPECTED_SHA256 = (
     "2155785036c900dbb5f1bb2a1569c80c"
@@ -56,6 +77,37 @@ session.mount(
     "https://platform-api2.max.ru/",
     ContextAdapter(ssl_context)
 )
+
+app = Flask(__name__)
+
+
+# Отправка сообщения пользователю
+def send_message(user_id, text, buttons=None):
+    body = {"text": text}
+
+    if buttons:
+        body["attachments"] = [
+            {
+                "type": "inline_keyboard",
+                "payload": {"buttons": buttons}
+            }
+        ]
+
+    response = session.post(
+        f"{API_URL}/messages",
+        headers=HEADERS,
+        params={"user_id": user_id},
+        json=body,
+        timeout=20
+    )
+
+    logging.info(
+        "Ответ MAX: %s %s",
+        response.status_code,
+        response.text
+    )
+
+    response.raise_for_status()
 
 
 # Главное меню
@@ -102,34 +154,6 @@ def send_menu(user_id):
     )
 
 
-def send_message(user_id, text, buttons=None):
-    body = {"text": text}
-
-    if buttons:
-        body["attachments"] = [
-            {
-                "type": "inline_keyboard",
-                "payload": {"buttons": buttons}
-            }
-        ]
-
-    response = session.post(
-        f"{API_URL}/messages",
-        headers=HEADERS,
-        params={"user_id": user_id},
-        json=body,
-        timeout=20
-    )
-
-    logging.info(
-        "Ответ MAX: %s %s",
-        response.status_code,
-        response.text
-    )
-
-    response.raise_for_status()
-
-
 # Обработка нажатий на кнопки
 def handle_button(user_id, payload):
     if payload == "price":
@@ -138,7 +162,7 @@ def handle_button(user_id, payload):
             "💰 Расчёт стоимости бурения.\n\n"
             "Скоро здесь можно будет выбрать диаметр отверстия, "
             "материал стены и глубину бурения.\n\n"
-            "Калькулятор стоимости подготовим следующим этапом."
+            "Калькулятор подготовим следующим этапом."
         )
 
     elif payload == "services":
@@ -146,8 +170,7 @@ def handle_button(user_id, payload):
             user_id,
             "🔹 Наши услуги\n\n"
             "Выполняем алмазное бурение отверстий "
-            "в бетоне, кирпиче и других материалах.\n\n"
-            "Работаем с различными диаметрами и глубиной бурения."
+            "в бетоне, кирпиче и других материалах."
         )
 
     elif payload == "location":
@@ -161,70 +184,133 @@ def handle_button(user_id, payload):
         send_message(
             user_id,
             "📞 Связь с нами\n\n"
-            "Напишите здесь, какое отверстие вам необходимо "
+            "Напишите, какое отверстие вам необходимо "
             "просверлить, и мы свяжемся с вами."
         )
 
-    elif payload == "menu":
-        send_menu(user_id)
+
+# Обработка события от MAX
+def handle_update(update):
+    update_type = update.get("update_type")
+
+    logging.info("Получено событие MAX: %s", update_type)
+
+    # Пользователь впервые запустил бота
+    if update_type == "bot_started":
+        user = update.get("user", {})
+        user_id = user.get("user_id")
+
+        if user_id:
+            logging.info("Первый запуск бота пользователем")
+            send_menu(user_id)
+
+    # Пользователь написал сообщение
+    elif update_type == "message_created":
+        message = update.get("message", {})
+        sender = message.get("sender", {})
+        user_id = sender.get("user_id")
+        text = message.get("body", {}).get("text", "")
+
+        if user_id and text:
+            send_menu(user_id)
+
+    # Пользователь нажал кнопку
+    elif update_type == "message_callback":
+        callback = update.get("callback", {})
+        user = callback.get("user", {})
+        user_id = user.get("user_id")
+        payload = callback.get("payload", "")
+
+        if user_id and payload:
+            handle_button(user_id, payload)
 
 
-def main():
-    marker = None
-    logging.info("Бот запущен и ожидает сообщения")
+# Проверка доступности сервера
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "ok"}), 200
 
-    while True:
-        try:
-            params = {"timeout": 30}
 
-            if marker is not None:
-                params["marker"] = marker
+# Приём событий MAX
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    received_secret = request.headers.get(
+        "X-Max-Bot-Api-Secret", ""
+    )
 
-            response = session.get(
-                f"{API_URL}/updates",
-                headers=HEADERS,
-                params=params,
-                timeout=40
-            )
+    if not hmac.compare_digest(
+        received_secret, WEBHOOK_SECRET
+    ):
+        logging.warning("Неверный секрет Webhook")
+        return jsonify({"error": "Unauthorized"}), 401
 
-            response.raise_for_status()
-            data = response.json()
+    update = request.get_json(silent=True)
 
-            marker = data.get("marker", marker)
+    if not isinstance(update, dict):
+        return jsonify({"error": "Invalid JSON"}), 400
 
-            for update in data.get("updates", []):
+    try:
+        handle_update(update)
+    except Exception:
+        logging.exception("Ошибка обработки Webhook")
+        return jsonify({"error": "Processing failed"}), 500
 
-                # Обычное сообщение пользователя
-                if update.get("update_type") == "message_created":
-                    message = update.get("message", {})
-                    sender = message.get("sender", {})
-                    user_id = sender.get("user_id")
-                    text = message.get("body", {}).get("text", "")
+    return jsonify({"ok": True}), 200
 
-                    if not user_id or not text:
-                        continue
 
-                    if text.strip().lower() in [
-                        "/start", "начать", "меню"
-                    ]:
-                        send_menu(user_id)
-                    else:
-                        send_menu(user_id)
+# Регистрация Webhook в MAX
+def register_webhook():
+    time.sleep(3)
 
-                # Нажатие на кнопку
-                elif update.get("update_type") == "message_callback":
-                    callback = update.get("callback", {})
-                    user = callback.get("user", {})
-                    user_id = user.get("user_id")
-                    payload = callback.get("payload", "")
+    payload = {
+        "url": WEBHOOK_URL,
+        "update_types": [
+            "bot_started",
+            "message_created",
+            "message_callback"
+        ],
+        "secret": WEBHOOK_SECRET
+    }
 
-                    if user_id and payload:
-                        handle_button(user_id, payload)
+    try:
+        response = session.post(
+            f"{API_URL}/subscriptions",
+            headers=HEADERS,
+            json=payload,
+            timeout=20
+        )
 
-        except Exception:
-            logging.exception("Ошибка при получении сообщений")
-            time.sleep(5)
+        logging.info(
+            "Регистрация Webhook: %s %s",
+            response.status_code,
+            response.text
+        )
+
+        response.raise_for_status()
+
+        result = response.json()
+
+        if result.get("success"):
+            logging.info("Webhook успешно зарегистрирован")
+        else:
+            logging.error("MAX не подтвердил регистрацию Webhook")
+
+    except Exception:
+        logging.exception("Не удалось зарегистрировать Webhook")
 
 
 if __name__ == "__main__":
-    main()
+    PORT = int(os.getenv("PORT", "3000"))
+
+    logging.info("Запускаем Webhook-сервер на порту %s", PORT)
+
+    threading.Thread(
+        target=register_webhook,
+        daemon=True
+    ).start()
+
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        threaded=True
+    )
