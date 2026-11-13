@@ -72,6 +72,8 @@ app = Flask(__name__)
 # Временные данные расчётов пользователей
 calculations = {}
 lead_states = {}
+order_states = {}
+request_states = {}
 
 # Тарифы: рубли за 1 см
 DIAMETERS = {
@@ -191,7 +193,110 @@ def ask_diameter(user_id):
         keyboard(items)
     )
 
+# =====================================
+# НОВЫЙ КАЛЬКУЛЯТОР: НЕСКОЛЬКО ОТВЕРСТИЙ
+# =====================================
 
+def start_order(user_id):
+    uid = str(user_id)
+
+    order_states[uid] = {
+        "positions": [],
+        "current": {},
+        "extras": set()
+    }
+
+    ask_position_diameter(user_id)
+
+
+def ask_position_diameter(user_id):
+    items = [
+        (f"{d} мм", f"order_diam:{d}")
+        for d in DIAMETERS
+    ]
+
+    items.append(("Отмена", "cancel"))
+
+    send_message(
+        user_id,
+        "🔹 НОВЫЙ ЗАКАЗ\n\n"
+        "Позиция №" +
+        str(len(order_states[str(user_id)]["positions"]) + 1) +
+        "\n\nВыберите диаметр отверстия:",
+        keyboard(items)
+    )
+
+
+def ask_position_material(user_id):
+    items = [
+        ("Кирпич", "order_material:Кирпич"),
+        ("Бетон", "order_material:Бетон"),
+        ("Армированный бетон", "order_material:Армированный бетон"),
+    ]
+
+    send_message(
+        user_id,
+        "Выберите материал стены:",
+        keyboard(items)
+    )
+
+
+def ask_position_depth(user_id):
+    send_message(
+        user_id,
+        "Введите глубину отверстия в сантиметрах.\n"
+        "Например: 30"
+    )
+
+
+def ask_position_quantity(user_id):
+    send_message(
+        user_id,
+        "Сколько одинаковых отверстий с такими параметрами нужно пробурить?\n\n"
+        "Введите количество числом.\n"
+        "Например: 5"
+    )
+
+
+def ask_position_conditions(user_id):
+    uid = str(user_id)
+    data = order_states[uid]["current"]
+
+    selected = data["conditions"]
+    height = data["height"]
+
+    lines = [
+        "Выберите условия бурения для этой позиции.",
+        "",
+        "Нажимайте на кнопки, чтобы отметить или снять условие.",
+        ""
+    ]
+
+    items = []
+
+    for key, (name, factor) in COEFFICIENTS.items():
+        mark = "✓ " if key in selected else ""
+        items.append((mark + name, f"order_cond:{key}"))
+
+        if key in selected:
+            lines.append(f"✅ {name} — ×{factor}")
+
+    for key, (name, factor) in HEIGHTS.items():
+        mark = "✓ " if height == key else ""
+        items.append((mark + name, f"order_height:{key}"))
+
+        if height == key:
+            lines.append(f"✅ {name} — ×{factor}")
+
+    items.append(("💾 Сохранить позицию", "order_save_position"))
+    items.append(("Отмена заказа", "cancel"))
+
+    send_message(
+        user_id,
+        "\n".join(lines),
+        keyboard(items, 1)
+    )
+    
 def ask_material(user_id):
     items = [
         ("Кирпич", "material:Кирпич"),
