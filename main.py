@@ -242,6 +242,9 @@ def ask_position_material(user_id):
 
 
 def ask_position_depth(user_id):
+    uid = str(user_id)
+    order_states[uid]["step"] = "depth"
+
     send_message(
         user_id,
         "Введите глубину отверстия в сантиметрах.\n"
@@ -250,6 +253,9 @@ def ask_position_depth(user_id):
 
 
 def ask_position_quantity(user_id):
+    uid = str(user_id)
+    order_states[uid]["step"] = "quantity"
+
     send_message(
         user_id,
         "Сколько одинаковых отверстий с такими параметрами нужно пробурить?\n\n"
@@ -467,6 +473,75 @@ def calculate(user_id):
 
 def handle_button(user_id, payload):
     uid = str(user_id)
+
+    # НОВЫЙ КАЛЬКУЛЯТОР
+
+    if payload == "order_price":
+        start_order(user_id)
+        return
+
+    if payload.startswith("order_diam:"):
+        if uid not in order_states:
+            return
+
+        diameter = int(payload.split(":")[1])
+
+        order_states[uid]["current"] = {
+            "diameter": diameter,
+            "material": None,
+            "depth": None,
+            "quantity": 1,
+            "conditions": set(),
+            "height": None
+        }
+
+        ask_position_material(user_id)
+        return
+
+    if payload.startswith("order_material:"):
+        if uid not in order_states:
+            return
+
+        material = payload.split(":", 1)[1]
+        order_states[uid]["current"]["material"] = material
+
+        ask_position_depth(user_id)
+        return
+
+    if payload.startswith("order_cond:"):
+        if uid not in order_states:
+            return
+
+        key = payload.split(":")[1]
+        data = order_states[uid]["current"]
+
+        if key in data["conditions"]:
+            data["conditions"].remove(key)
+        else:
+            data["conditions"].add(key)
+
+        ask_position_conditions(user_id)
+        return
+
+    if payload.startswith("order_height:"):
+        if uid not in order_states:
+            return
+
+        key = payload.split(":")[1]
+        data = order_states[uid]["current"]
+
+        data["height"] = None if data["height"] == key else key
+
+        ask_position_conditions(user_id)
+        return
+
+    if payload == "order_save_position":
+        if uid not in order_states:
+            return
+
+        ask_position_quantity(user_id)
+        return
+        
     if payload == "lead_start":
         if uid not in calculations or "result" not in calculations[uid]:
             send_message(user_id, "Сначала выполните расчёт стоимости.")
