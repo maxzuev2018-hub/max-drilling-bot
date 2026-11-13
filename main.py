@@ -686,7 +686,44 @@ def handle_update(update):
             return
 
         uid = str(user_id)
+        # Обработка глубины и количества в новом калькуляторе
+        if uid in order_states:
+            state = order_states[uid]
 
+            if state.get("step") == "depth":
+                try:
+                    depth = float(text.replace(",", "."))
+                    if depth <= 0:
+                        raise ValueError
+
+                    state["current"]["depth"] = depth
+                    ask_position_quantity(user_id)
+
+                except ValueError:
+                    send_message(
+                        user_id,
+                        "Введите корректную глубину числом. Например: 30"
+                    )
+
+                return
+
+            if state.get("step") == "quantity":
+                try:
+                    quantity = int(text)
+
+                    if quantity <= 0:
+                        raise ValueError
+
+                    state["current"]["quantity"] = quantity
+                    ask_position_conditions(user_id)
+
+                except ValueError:
+                    send_message(
+                        user_id,
+                        "Введите количество целым положительным числом. Например: 5"
+                    )
+
+                return
         if uid in lead_states:
             state = lead_states[uid]
 
