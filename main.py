@@ -87,6 +87,7 @@ app = Flask(__name__)
 
 order_states = {}
 lead_states = {}
+admin_search_states = set()
 
 # Постоянная история расчётов хранится в SQLite рядом с main.py.
 DB_FILE = Path(__file__).resolve().parent / "orders_history.sqlite3"
@@ -211,39 +212,114 @@ def show_admin_panel(user_id):
         work_count = connection.execute(
             "SELECT COUNT(*) FROM customer_requests WHERE status = 'В работе'"
         ).fetchone()[0]
+        done_count = connection.execute(
+            "SELECT COUNT(*) FROM customer_requests WHERE status = 'Завершена'"
+        ).fetchone()[0]
     buttons = [
         [{"type": "callback", "text": "📥 Все заявки", "payload": "admin_orders"}],
         [{"type": "callback", "text": "🆕 Новые заявки", "payload": "admin_orders_new"}],
+        [{"type": "callback", "text": "🔧 Заявки в работе", "payload": "admin_orders_work"}],
+        [{"type": "callback", "text": "✅ Завершённые", "payload": "admin_orders_done"}],
+        [{"type": "callback", "text": "🔎 Поиск по имени или телефону", "payload": "admin_search"}],
         [{"type": "callback", "text": "🏠 Главное меню", "payload": "menu"}],
     ]
-    send_message(user_id,
-        f"🛠 АДМИН-ПАНЕЛЬ\n\nВсего заявок: {total}\nНовых: {new_count}\nВ работе: {work_count}",
-        buttons)
+    send_message(
+        user_id,
+        f"🛠 АДМИН-ПАНЕЛЬ\n\nВсего заявок: {total}\nНовых: {new_count}\n"
+        f"В работе: {work_count}\nЗавершённых: {done_count}",
+        buttons
+    )
 
 
-def show_admin_orders(user_id, only_new=False):
+def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
     if not is_admin(user_id):
         send_message(user_id, "⛔ Доступ запрещён.")
         return
+
+    if only_new:
+        status = "Новая"
+    conditions = []
+    params = []
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if search_term:
+        conditions.append("(customer_name LIKE ? OR phone LIKE ? OR CAST(id AS TEXT) LIKE ?)")
+        pattern = f"%{search_term}%"
+        params.extend([pattern, pattern, pattern])
+
     query = (
         "SELECT id, created_at, customer_name, phone, status "
-        "FROM customer_requests WHERE status = 'Новая' ORDER BY id DESC LIMIT 20"
-        if only_new else
-        "SELECT id, created_at, customer_name, phone, status "
-        "FROM customer_requests ORDER BY id DESC LIMIT 20"
+        "FROM customer_requests"
     )
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY id DESC LIMIT 20"
+
     with sqlite3.connect(DB_FILE) as connection:
-        rows = connection.execute(query).fetchall()
+        rows = connection.execute(query, params).fetchall()
+
+    if search_term:
+        title = f"🔎 РЕЗУЛЬТАТЫ ПОИСКА: {search_term}"
+    elif status == "Новая":
+        title = "🆕 НОВЫЕ ЗАЯВКИ"
+    elif status == "В работе":
+        title = "🔧 ЗАЯВКИ В РАБОТЕ"
+    elif status == "Завершена":
+        title = "✅ ЗАВЕРШЁННЫЕ ЗАЯВКИ"
+    else:
+        title = "📋 ВСЕ ЗАЯВКИ"
+
     if not rows:
-        send_message(user_id, "Заявок пока нет.", [[{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}]])
+        buttons = [
+            [{"type": "callback", "text": "🔎 Новый поиск", "payload": "admin_search"}],
+            [{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}],
+        ]
+        send_message(user_id, f"{title}\n\nНичего не найдено.", buttons)
         return
-    lines = ["📥 НОВЫЕ ЗАЯВКИ" if only_new else "📋 ВСЕ ЗАЯВКИ", ""]
+
+    lines = [title, "", "Показаны последние 20 подходящих заявок:"]
     buttons = []
-    for order_id, created_at, name, phone, status in rows:
-        lines.append(f"№{order_id} — {name} — {status} — {created_at}")
-        buttons.append([{"type": "callback", "text": f"Открыть заявку №{order_id}", "payload": f"admin_order:{order_id}"}])
-    buttons.append([{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}])
+    for order_id, created_at, name, phone, order_status in rows:
+        lines.append(f"№{order_id} — {name} — {order_status} — {created_at}")
+        buttons.append([{
+            "type": "callback",
+            "text": f"Открыть заявку №{order_id}",
+            "payload": f"admin_order:{order_id}"
+        }])
+    buttons.extend([
+        [{"type": "callback", "text": "🔎 Поиск", "payload": "admin_search"}],
+        [{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}],
+    ])
     send_message(user_id, "\n".join(lines), buttons)
+
+
+def start_admin_search(user_id):
+    if not is_admin(user_id):
+        send_message(user_id, "⛔ Доступ запрещён.")
+        return
+    admin_search_states.add(str(user_id))
+    send_message(
+        user_id,
+        "🔎 Поиск заявок\n\nВведите имя клиента, часть имени, номер телефона "
+        "или номер заявки. Для отмены нажмите кнопку ниже.",
+        [[{"type": "callback", "text": "Отмена поиска", "payload": "admin_search_cancel"}],
+         [{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}]]
+    )
+
+
+def process_admin_search(user_id, search_term):
+    uid = str(user_id)
+    admin_search_states.discard(uid)
+    if not is_admin(user_id):
+        send_message(user_id, "⛔ Доступ запрещён.")
+        return
+    term = search_term.strip()
+    if not term:
+        send_message(user_id, "Введите имя, телефон или номер заявки для поиска.")
+        start_admin_search(user_id)
+        return
+    show_admin_orders(user_id, search_term=term)
 
 
 def show_admin_order(user_id, order_id):
@@ -911,6 +987,23 @@ def handle_button(user_id, payload):
         show_admin_orders(user_id, only_new=True)
         return
 
+    if payload == "admin_orders_work":
+        show_admin_orders(user_id, status="В работе")
+        return
+
+    if payload == "admin_orders_done":
+        show_admin_orders(user_id, status="Завершена")
+        return
+
+    if payload == "admin_search":
+        start_admin_search(user_id)
+        return
+
+    if payload == "admin_search_cancel":
+        admin_search_states.discard(uid)
+        show_admin_panel(user_id)
+        return
+
     if payload.startswith("admin_order:"):
         try:
             order_id = int(payload.split(":", 1)[1])
@@ -1221,6 +1314,11 @@ def handle_update(update):
 
     uid = str(user_id)
     text = text.strip()
+
+    # Поисковый запрос администратора обрабатываем до остальных текстовых сценариев.
+    if uid in admin_search_states:
+        process_admin_search(user_id, text)
+        return
 
     # Сначала обрабатываем ввод глубины и количества в калькуляторе.
     if uid in order_states:
