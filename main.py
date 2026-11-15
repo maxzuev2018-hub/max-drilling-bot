@@ -582,20 +582,29 @@ def ask_position_diameter(user_id):
 
 
 
+
 def ask_position_material(user_id):
     items = [
-        ("Кирпич", "order_material:Кирпич"),
-        ("Бетон", "order_material:Бетон"),
-        ("Армированный бетон", "order_material:Армированный бетон"),
+        ("🧱 Кирпич", "order_material:Кирпич"),
+        ("🏗 Бетон", "order_material:Бетон"),
+        ("⚙️ Армированный бетон", "order_material:Армированный бетон"),
         ("⬅️ Назад к диаметру", "order_back:diameter"),
-        ("Отмена заказа", "cancel"),
+        ("❌ Отмена заказа", "cancel"),
     ]
 
     send_message(
         user_id,
-        "Выберите материал стены:",
+        "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "НОВЫЙ ЗАКАЗ\n\n"
+        "🧱 ВЫБОР МАТЕРИАЛА\n\n"
+        "Укажите материал стены, в которой "
+        "необходимо выполнить отверстие:\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО",
         keyboard(items, 1)
     )
+
 
 
 def ask_position_depth(user_id):
