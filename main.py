@@ -251,21 +251,27 @@ def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
     if status:
         conditions.append("status = ?")
         params.append(status)
-    if search_term:
-        conditions.append("(customer_name LIKE ? OR phone LIKE ? OR CAST(id AS TEXT) LIKE ?)")
-        pattern = f"%{search_term}%"
-        params.extend([pattern, pattern, pattern])
-
     query = (
         "SELECT id, created_at, customer_name, phone, status "
         "FROM customer_requests"
     )
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY id DESC LIMIT 20"
+    query += " ORDER BY id DESC"
 
     with sqlite3.connect(DB_FILE) as connection:
         rows = connection.execute(query, params).fetchall()
+
+    # Ищем имя без учёта регистра, в том числе для русских букв.
+    # SQLite LIKE/NOCASE не обеспечивает полноценный Unicode case-insensitive поиск.
+    if search_term:
+        normalized_term = search_term.casefold()
+        rows = [
+            row for row in rows
+            if normalized_term in str(row[2] or "").casefold()
+            or normalized_term in str(row[3] or "")
+            or normalized_term in str(row[0])
+        ][:20]
 
     if search_term:
         title = f"🔎 РЕЗУЛЬТАТЫ ПОИСКА: {search_term}"
