@@ -8,6 +8,9 @@ import logging
 import threading
 import sqlite3
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 from pathlib import Path
 from copy import deepcopy
 
@@ -135,7 +138,7 @@ def save_order_history(user_id, total, result):
         connection.execute(
             "INSERT INTO order_history (user_id, created_at, total, result) "
             "VALUES (?, ?, ?, ?)",
-            (str(user_id), datetime.now().strftime("%d.%m.%Y %H:%M"), float(total), result)
+            (str(user_id), datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M"), float(total), result)
         )
 
 
@@ -199,7 +202,7 @@ def save_customer_request(user_id, customer_name, phone, result):
             "INSERT INTO customer_requests "
             "(user_id, created_at, customer_name, phone, result, status) "
             "VALUES (?, ?, ?, ?, ?, 'Новая')",
-            (str(user_id), datetime.now().strftime("%d.%m.%Y %H:%M"),
+            (str(user_id), datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M"),
              customer_name, phone, result)
         )
         return cursor.lastrowid
