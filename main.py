@@ -89,8 +89,13 @@ order_states = {}
 lead_states = {}
 admin_search_states = set()
 
-# Постоянная история расчётов хранится в SQLite рядом с main.py.
-DB_FILE = Path(__file__).resolve().parent / "orders_history.sqlite3"
+# Постоянные расчёты и заявки хранятся в общем хранилище Bothost.
+# После подключения общего хранилища путь /app/shared сохраняется
+# между обновлениями и перезапусками приложения.
+SHARED_DIR = Path("/app/shared")
+SHARED_DIR.mkdir(parents=True, exist_ok=True)
+DB_FILE = SHARED_DIR / "orders_history.sqlite3"
+logging.info("База заказов и заявок: %s", DB_FILE)
 
 
 def init_history_db():
