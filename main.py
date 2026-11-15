@@ -277,6 +277,7 @@ def ask_position_material(user_id):
         ("Кирпич", "order_material:Кирпич"),
         ("Бетон", "order_material:Бетон"),
         ("Армированный бетон", "order_material:Армированный бетон"),
+        ("⬅️ Назад к диаметру", "order_back:diameter"),
         ("Отмена заказа", "cancel"),
     ]
 
@@ -295,7 +296,11 @@ def ask_position_depth(user_id):
         user_id,
         "Введите глубину одного отверстия в сантиметрах.\n\n"
         "Например: 30\n\n"
-        "Можно использовать запятую или точку."
+        "Можно использовать запятую или точку.",
+        [[
+            {"type": "callback", "text": "⬅️ Назад к материалу", "payload": "order_back:material"},
+            {"type": "callback", "text": "Отмена заказа", "payload": "cancel"}
+        ]]
     )
 
 
@@ -307,7 +312,11 @@ def ask_position_quantity(user_id):
         user_id,
         "Сколько одинаковых отверстий с такими параметрами нужно пробурить?\n\n"
         "Введите количество целым числом.\n"
-        "Например: 5"
+        "Например: 5",
+        [[
+            {"type": "callback", "text": "⬅️ Назад к глубине", "payload": "order_back:depth"},
+            {"type": "callback", "text": "Отмена заказа", "payload": "cancel"}
+        ]]
     )
 
 
@@ -350,6 +359,7 @@ def ask_position_conditions(user_id):
         if data["night"]:
             lines.append("• Ночное время: ×1,5 на весь заказ")
 
+    items.append(("⬅️ Назад к количеству", "order_back:quantity"))
     items.append(("💾 Сохранить позицию", "order_save_position"))
     items.append(("Отмена заказа", "cancel"))
 
@@ -708,6 +718,49 @@ def handle_button(user_id, payload):
             return
 
         ask_order_extras(user_id)
+        return
+
+    if payload.startswith("order_back:"):
+        if uid not in order_states or not order_states[uid].get("current"):
+            return
+
+        target = payload.split(":", 1)[1]
+        data = order_states[uid]["current"]
+
+        if target == "diameter":
+            order_states[uid]["current"] = None
+            order_states[uid].pop("step", None)
+            ask_position_diameter(user_id)
+            return
+
+        if target == "material":
+            data["material"] = None
+            data["depth"] = None
+            data["quantity"] = 1
+            data["conditions"] = set()
+            data["height"] = None
+            data["night"] = False
+            order_states[uid].pop("step", None)
+            ask_position_material(user_id)
+            return
+
+        if target == "depth":
+            data["depth"] = None
+            data["quantity"] = 1
+            data["conditions"] = set()
+            data["height"] = None
+            data["night"] = False
+            ask_position_depth(user_id)
+            return
+
+        if target == "quantity":
+            data["quantity"] = 1
+            data["conditions"] = set()
+            data["height"] = None
+            data["night"] = False
+            ask_position_quantity(user_id)
+            return
+
         return
 
     if payload.startswith("order_diam:"):
