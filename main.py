@@ -449,8 +449,7 @@ def send_message(user_id, text, buttons=None):
 
 def notify_admin(text):
     if not ADMIN_USER_ID:
-        logging.error("Не задан ADMIN_USER_ID")
-        return
+        raise RuntimeError("Не задан ADMIN_USER_ID")
 
     send_message(ADMIN_USER_ID, text)
 
@@ -1027,6 +1026,7 @@ def ask_lead_phone(user_id):
 
 
 
+
 def process_lead_message(user_id, text):
 
     uid = str(user_id)
@@ -1064,9 +1064,14 @@ def process_lead_message(user_id, text):
             )
             return
 
-        request_id = save_customer_request(
-            user_id, state["name"], phone, state["result"]
-        )
+        state["phone"] = phone
+
+        if not state.get("request_id"):
+            state["request_id"] = save_customer_request(
+                user_id, state["name"], phone, state["result"]
+            )
+
+        request_id = state["request_id"]
 
         admin_message = (
             f"💎 НОВАЯ ЗАЯВКА №{request_id}\n"
@@ -1086,8 +1091,10 @@ def process_lead_message(user_id, text):
                 user_id,
                 "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-                "⚠️ Не удалось отправить заявку автоматически.\n"
-                "Пожалуйста, попробуйте позже или свяжитесь с нами напрямую."
+                "⚠️ Заявка сохранена, но уведомление менеджеру "
+                "не отправлено.\n"
+                "Отправьте номер телефона ещё раз, чтобы повторить "
+                "уведомление. Новая заявка создана не будет."
             )
             return
 
@@ -1109,6 +1116,7 @@ def process_lead_message(user_id, text):
                 "payload": "menu"
             }]]
         )
+
 
 
 # =========================================================
@@ -1518,7 +1526,7 @@ def handle_update(update):
             except (ValueError, TypeError):
                 send_message(
                     user_id,
-                    "Введите количество целым числом от 1 до 100000. "
+                    "Введите количество целым числом от 1 до 200. "
                     "Например: 5"
                 )
 
@@ -1526,13 +1534,25 @@ def handle_update(update):
 
     # Затем обрабатываем имя и телефон заявки.
     if uid in lead_states:
+        state = lead_states[uid]
+
+        if state.get("step") == "ready":
+            send_message(
+                user_id,
+                "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "📋 Ваш расчёт готов!\n\n"
+                "Чтобы оставить заявку и получить консультацию "
+                "менеджера, нажмите кнопку «Оставить заявку» "
+                "под результатом расчёта."
+            )
+            return
+
         process_lead_message(user_id, text)
         return
-
     # Если пользователь написал произвольный текст вне сценария,
     # показываем главное меню.
     main_menu(user_id)
-
 
 # =========================================================
 # FLASK WEBHOOK
