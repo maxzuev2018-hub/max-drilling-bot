@@ -1497,7 +1497,7 @@ def handle_update(update):
             try:
                 depth = float(text.replace(",", "."))
 
-                if depth <= 0 or depth > 10000:
+                if depth <= 0 or depth > 500:
                     raise ValueError
 
                 state["current"]["depth"] = depth
@@ -1506,7 +1506,7 @@ def handle_update(update):
             except (ValueError, AttributeError):
                 send_message(
                     user_id,
-                    "Введите корректную глубину числом от 0 до 10000 см. "
+                    "Введите корректную глубину числом от 0 до 500 см. "
                     "Например: 30"
                 )
 
@@ -1526,7 +1526,7 @@ def handle_update(update):
             except (ValueError, TypeError):
                 send_message(
                     user_id,
-                    "Введите количество целым числом от 1 до 200. "
+                    "Введите количество целым числом от 1 до 100000. "
                     "Например: 5"
                 )
 
