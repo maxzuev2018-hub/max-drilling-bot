@@ -607,20 +607,37 @@ def ask_position_material(user_id):
 
 
 
+
 def ask_position_depth(user_id):
     uid = str(user_id)
     order_states[uid]["step"] = "depth"
 
     send_message(
         user_id,
-        "Введите глубину одного отверстия в сантиметрах.\n\n"
+        "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "НОВЫЙ ЗАКАЗ\n\n"
+        "📏 ГЛУБИНА ОТВЕРСТИЯ\n\n"
+        "Укажите глубину одного отверстия "
+        "в сантиметрах.\n\n"
         "Например: 30\n\n"
-        "Можно использовать запятую или точку.",
+        "Можно использовать запятую или точку.\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО",
         [[
-            {"type": "callback", "text": "⬅️ Назад к материалу", "payload": "order_back:material"},
-            {"type": "callback", "text": "Отмена заказа", "payload": "cancel"}
+            {
+                "type": "callback",
+                "text": "⬅️ Назад к материалу",
+                "payload": "order_back:material"
+            },
+            {
+                "type": "callback",
+                "text": "❌ Отмена заказа",
+                "payload": "cancel"
+            }
         ]]
     )
+
 
 
 def ask_position_quantity(user_id):
@@ -629,14 +646,30 @@ def ask_position_quantity(user_id):
 
     send_message(
         user_id,
-        "Сколько одинаковых отверстий с такими параметрами нужно пробурить?\n\n"
-        "Введите количество целым числом.\n"
-        "Например: 5",
+        "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "НОВЫЙ ЗАКАЗ\n\n"
+        "🔢 КОЛИЧЕСТВО ОТВЕРСТИЙ\n\n"
+        "Сколько одинаковых отверстий "
+        "с выбранными параметрами необходимо пробурить?\n\n"
+        "Укажите количество целым числом.\n\n"
+        "Например: 5\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО",
         [[
-            {"type": "callback", "text": "⬅️ Назад к глубине", "payload": "order_back:depth"},
-            {"type": "callback", "text": "Отмена заказа", "payload": "cancel"}
+            {
+                "type": "callback",
+                "text": "⬅️ Назад к глубине",
+                "payload": "order_back:depth"
+            },
+            {
+                "type": "callback",
+                "text": "❌ Отмена заказа",
+                "payload": "cancel"
+            }
         ]]
     )
+
 
 
 def ask_position_conditions(user_id):
@@ -645,10 +678,15 @@ def ask_position_conditions(user_id):
     data = state["current"]
 
     lines = [
-        "Условия бурения для позиции "
-        f"№{len(state['positions']) + 1}:",
+        "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ",
+        "━━━━━━━━━━━━━━━━━━",
         "",
-        "Нажимайте кнопки, чтобы включить или выключить условия.",
+        "НОВЫЙ ЗАКАЗ",
+        "",
+        f"⚙️ УСЛОВИЯ БУРЕНИЯ — ПОЗИЦИЯ №{len(state['positions']) + 1}",
+        "",
+        "Выберите дополнительные условия.",
+        "Нажимайте кнопки, чтобы включить или выключить их.",
         ""
     ]
 
@@ -663,10 +701,10 @@ def ask_position_conditions(user_id):
         items.append((mark + name, f"order_height:{key}"))
 
     night_mark = "✓ " if data["night"] else ""
-    items.append((night_mark + "Ночное время (20:00–8:00)", "order_night"))
+    items.append((night_mark + "🌙 Ночное время (20:00–8:00)", "order_night"))
 
     if data["conditions"] or data["height"] or data["night"]:
-        lines.append("Выбранные условия:")
+        lines.append("📌 ВЫБРАННЫЕ УСЛОВИЯ:")
         for key in data["conditions"]:
             name, factor = COEFFICIENTS[key]
             lines.append(f"• {name}: ×{factor}")
@@ -678,9 +716,15 @@ def ask_position_conditions(user_id):
         if data["night"]:
             lines.append("• Ночное время: ×1,5 на весь заказ")
 
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО"
+    ])
+
     items.append(("⬅️ Назад к количеству", "order_back:quantity"))
     items.append(("💾 Сохранить позицию", "order_save_position"))
-    items.append(("Отмена заказа", "cancel"))
+    items.append(("❌ Отмена заказа", "cancel"))
 
     send_message(
         user_id,
@@ -689,26 +733,36 @@ def ask_position_conditions(user_id):
     )
 
 
+
 def ask_after_position(user_id):
+
     uid = str(user_id)
     count = len(order_states[uid]["positions"])
 
     items = [
         ("➕ Добавить ещё одну позицию", "order_add_position"),
         ("✅ Завершить заказ и рассчитать", "order_finish"),
-        ("Отмена заказа", "cancel"),
+        ("❌ Отмена заказа", "cancel"),
     ]
 
     send_message(
         user_id,
-        f"Позиция сохранена! ✅\n\n"
-        f"В заказе сейчас позиций: {count}.\n\n"
-        "Что будем делать дальше?",
+        "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "✅ ПОЗИЦИЯ СОХРАНЕНА\n\n"
+        f"📋 В ЗАКАЗЕ ПОЗИЦИЙ: {count}\n\n"
+        "Вы можете добавить отверстия "
+        "с другими параметрами или перейти "
+        "к итоговому расчёту заказа.\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО",
         keyboard(items, 1)
     )
 
 
+
 def ask_order_extras(user_id):
+
     uid = str(user_id)
     selected = order_states[uid]["extras"]
 
@@ -729,27 +783,49 @@ def ask_order_extras(user_id):
     items.extend([
         ("💰 Рассчитать стоимость заказа", "order_calculate"),
         ("➕ Вернуться к позициям", "order_add_position"),
-        ("Отмена заказа", "cancel"),
+        ("❌ Отмена заказа", "cancel"),
     ])
 
     send_message(
         user_id,
-        "Дополнительные услуги для всего заказа.\n\n"
-        "Отметьте необходимые услуги. "
-        "Каждая выбранная услуга учитывается один раз на весь заказ.",
+        "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🛠 ДОПОЛНИТЕЛЬНЫЕ УСЛУГИ\n\n"
+        "Выберите дополнительные услуги "
+        "для всего заказа.\n\n"
+        "Отмечайте необходимые пункты кнопками.\n"
+        "Каждая выбранная услуга учитывается "
+        "один раз на весь заказ.\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО",
         keyboard(items, 1)
     )
 
 
+
 def calculate_order(user_id):
+
     uid = str(user_id)
     state = order_states.get(uid)
 
     if not state or not state["positions"]:
-        send_message(user_id, "В заказе пока нет ни одной позиции.")
+        send_message(
+            user_id,
+            "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "⚠️ В заказе пока нет ни одной позиции.\n\n"
+            "Добавьте хотя бы одну позицию для расчёта."
+        )
         return
 
-    lines = ["💰 ПРЕДВАРИТЕЛЬНЫЙ РАСЧЁТ ЗАКАЗА", ""]
+    lines = [
+        "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        "📋 ПРЕДВАРИТЕЛЬНАЯ СМЕТА ЗАКАЗА",
+        ""
+    ]
+
     drilling_subtotal = 0.0
     has_night = any(
         position.get("night", False)
@@ -787,14 +863,16 @@ def calculate_order(user_id):
         drilling_subtotal += position_total
 
         lines.extend([
-            f"ПОЗИЦИЯ №{index}",
-            f"Диаметр: {diameter} мм",
-            f"Материал: {material}",
+            "━━━━━━━━━━━━━━━━━━",
+            f"📌 ПОЗИЦИЯ №{index}",
+            f"📏 Диаметр: {diameter} мм",
+            f"🧱 Материал: {material}",
             f"Глубина одного отверстия: {depth:g} см",
-            f"Количество: {quantity}",
+            f"🔢 Количество отверстий: {quantity}",
+            "",
             f"Цена за 1 см: {rate} ₽",
             f"Стоимость одного отверстия: {one_hole_price:.2f} ₽",
-            f"Стоимость позиции: {position_total:.2f} ₽",
+            f"💰 СТОИМОСТЬ ПОЗИЦИИ: {position_total:.2f} ₽",
         ])
 
         if details:
@@ -802,7 +880,7 @@ def calculate_order(user_id):
 
         if position.get("night"):
             lines.append(
-                "Ночное время выбрано: коэффициент будет применён ко всему заказу."
+                "🌙 Ночное время выбрано: коэффициент будет применён ко всему заказу."
             )
 
         lines.append("")
@@ -811,9 +889,11 @@ def calculate_order(user_id):
         before_night = drilling_subtotal
         drilling_subtotal *= 1.5
         lines.extend([
-            "Ночной коэффициент применён один раз ко всему бурению заказа: ×1,5",
-            f"Бурение до ночного коэффициента: {before_night:.2f} ₽",
-            f"Бурение с ночным коэффициентом: {drilling_subtotal:.2f} ₽",
+            "━━━━━━━━━━━━━━━━━━",
+            "🌙 НОЧНОЙ КОЭФФИЦИЕНТ ×1,5",
+            "Применён один раз ко всему бурению заказа.",
+            f"Бурение до коэффициента: {before_night:.2f} ₽",
+            f"Бурение с коэффициентом: {drilling_subtotal:.2f} ₽",
             ""
         ])
 
@@ -833,26 +913,36 @@ def calculate_order(user_id):
 
     total = drilling_subtotal + extra_total
 
-    lines.append(f"ИТОГО бурение: {drilling_subtotal:.2f} ₽")
+    lines.append(f"💎 ИТОГО БУРЕНИЕ: {drilling_subtotal:.2f} ₽")
 
     if extra_lines:
         lines.append("")
-        lines.append("ДОПОЛНИТЕЛЬНЫЕ УСЛУГИ:")
+        lines.append("🛠 ДОПОЛНИТЕЛЬНЫЕ УСЛУГИ:")
         lines.extend(extra_lines)
-        lines.append(f"Стоимость услуг с фиксированной ценой: {extra_total:.2f} ₽")
+        lines.append(
+            f"Стоимость услуг с фиксированной ценой: {extra_total:.2f} ₽"
+        )
 
     lines.extend([
         "",
-        f"ОБЩАЯ СТОИМОСТЬ: {total:.2f} ₽",
+        "━━━━━━━━━━━━━━━━━━",
+        f"💰 ОБЩАЯ СТОИМОСТЬ: {total:.2f} ₽",
+        "━━━━━━━━━━━━━━━━━━",
         "",
-        "Это предварительный расчёт. Окончательная стоимость "
-        "уточняется после согласования деталей заказа."
+        "Это предварительный расчёт.",
+        "Окончательная стоимость уточняется "
+        "после согласования деталей заказа."
     ])
 
     if "waste" in state["extras"]:
         lines.append(
             "Вывоз мусора оплачивается отдельно по договорённости."
         )
+
+    lines.extend([
+        "",
+        "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО"
+    ])
 
     result = "\n".join(lines)
 
@@ -869,7 +959,7 @@ def calculate_order(user_id):
 
     send_message(
         user_id,
-        result + "\n\nХотите оставить заявку?",
+        result + "\n\n📩 Хотите оформить заявку?",
         [
             [{
                 "type": "callback",
@@ -894,6 +984,7 @@ def calculate_order(user_id):
 # ЗАЯВКА: С РАСЧЁТОМ И БЕЗ РАСЧЁТА
 # =========================================================
 
+
 def start_lead(user_id, result):
     uid = str(user_id)
     order_states.pop(uid, None)
@@ -903,21 +994,41 @@ def start_lead(user_id, result):
         "result": result
     }
 
-    send_message(user_id, "Как вас зовут?")
+    send_message(
+        user_id,
+        "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "📩 ОФОРМЛЕНИЕ ЗАЯВКИ\n\n"
+        "Благодарим за обращение!\n\n"
+        "Чтобы наш менеджер мог связаться с вами, "
+        "пожалуйста, укажите ваше имя.\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО"
+    )
+
 
 
 def ask_lead_phone(user_id):
+
     uid = str(user_id)
     lead_states[uid]["step"] = "phone"
 
     send_message(
         user_id,
-        "📞 Теперь отправьте номер телефона.\n"
-        "Например: +79991234567"
+        "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "📞 КОНТАКТНЫЙ НОМЕР\n\n"
+        "Укажите номер телефона, по которому "
+        "наш менеджер сможет связаться с вами.\n\n"
+        "Например: +79991234567\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "ВАША ЗАЯВКА • НАШЕ ВНИМАНИЕ"
     )
 
 
+
 def process_lead_message(user_id, text):
+
     uid = str(user_id)
     state = lead_states[uid]
 
@@ -925,7 +1036,13 @@ def process_lead_message(user_id, text):
         name = text.strip()
 
         if len(name) < 2:
-            send_message(user_id, "Пожалуйста, введите имя.")
+            send_message(
+                user_id,
+                "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "⚠️ Пожалуйста, введите корректное имя.\n"
+                "Имя должно содержать не менее двух символов."
+            )
             return
 
         state["name"] = name
@@ -939,18 +1056,24 @@ def process_lead_message(user_id, text):
         if len(digits) < 10 or len(digits) > 15:
             send_message(
                 user_id,
-                "Пожалуйста, введите корректный номер телефона."
+                "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "⚠️ Некорректный номер телефона.\n"
+                "Пожалуйста, проверьте номер и отправьте его ещё раз.\n\n"
+                "Например: +79991234567"
             )
             return
 
         request_id = save_customer_request(
             user_id, state["name"], phone, state["result"]
         )
+
         admin_message = (
-            f"📩 НОВАЯ ЗАЯВКА №{request_id}!\n\n"
-            f"Имя: {state['name']}\n"
-            f"Телефон: {phone}\n"
-            f"ID клиента MAX: {user_id}\n\n"
+            f"💎 НОВАЯ ЗАЯВКА №{request_id}\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 Имя: {state['name']}\n"
+            f"📞 Телефон: {phone}\n"
+            f"🆔 ID клиента MAX: {user_id}\n\n"
             f"{state['result']}\n\n"
             "Откройте админ-панель бота, чтобы изменить статус заявки."
         )
@@ -961,7 +1084,9 @@ def process_lead_message(user_id, text):
             logging.exception("Не удалось отправить заявку администратору")
             send_message(
                 user_id,
-                "Не удалось отправить заявку автоматически. "
+                "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "⚠️ Не удалось отправить заявку автоматически.\n"
                 "Пожалуйста, попробуйте позже или свяжитесь с нами напрямую."
             )
             return
@@ -970,8 +1095,14 @@ def process_lead_message(user_id, text):
 
         send_message(
             user_id,
-            "✅ Спасибо! Ваша заявка отправлена.\n"
-            "Мы свяжемся с вами в ближайшее время.",
+            "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "✅ ВАША ЗАЯВКА ОТПРАВЛЕНА!\n\n"
+            "Благодарим за обращение.\n"
+            "Наш менеджер свяжется с вами "
+            "в ближайшее время.\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО",
             [[{
                 "type": "callback",
                 "text": "🏠 Главное меню",
