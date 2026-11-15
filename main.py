@@ -286,7 +286,7 @@ def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
     lines = [title, "", "Показаны последние 20 подходящих заявок:"]
     buttons = []
     for order_id, created_at, name, phone, order_status in rows:
-        lines.append(f"№{order_id} — {name} — {order_status} — {created_at}")
+        lines.append(f"№{order_id} — {name} — {phone} — {order_status} — {created_at}")
         buttons.append([{
             "type": "callback",
             "text": f"Открыть заявку №{order_id}",
