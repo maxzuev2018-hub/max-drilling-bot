@@ -6,6 +6,8 @@ import hmac
 import hashlib
 import logging
 import threading
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 from copy import deepcopy
 
@@ -85,6 +87,85 @@ app = Flask(__name__)
 
 order_states = {}
 lead_states = {}
+
+# Постоянная история расчётов хранится в SQLite рядом с main.py.
+DB_FILE = Path(__file__).resolve().parent / "orders_history.sqlite3"
+
+
+def init_history_db():
+    with sqlite3.connect(DB_FILE) as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS order_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                total REAL NOT NULL,
+                result TEXT NOT NULL
+            )
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_order_history_user "
+            "ON order_history(user_id, id DESC)"
+        )
+
+
+def save_order_history(user_id, total, result):
+    with sqlite3.connect(DB_FILE) as connection:
+        connection.execute(
+            "INSERT INTO order_history (user_id, created_at, total, result) "
+            "VALUES (?, ?, ?, ?)",
+            (str(user_id), datetime.now().strftime("%d.%m.%Y %H:%M"), float(total), result)
+        )
+
+
+def show_order_history(user_id):
+    with sqlite3.connect(DB_FILE) as connection:
+        rows = connection.execute(
+            "SELECT id, created_at, total FROM order_history "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+            (str(user_id),)
+        ).fetchall()
+
+    if not rows:
+        send_message(
+            user_id,
+            "📋 История заказов пока пуста.\n\n"
+            "Здесь будут отображаться ваши сохранённые расчёты.",
+            [[{"type": "callback", "text": "🏠 Главное меню", "payload": "menu"}]]
+        )
+        return
+
+    items = []
+    lines = ["📋 ВАША ИСТОРИЯ ЗАКАЗОВ", "", "Последние 10 расчётов:"]
+    for order_id, created_at, total in rows:
+        lines.append(f"№{order_id} — {created_at} — {total:.2f} ₽")
+        items.append((f"Открыть заказ №{order_id}", f"history_view:{order_id}"))
+    items.append(("🏠 Главное меню", "menu"))
+    send_message(user_id, "\n".join(lines), keyboard(items, 1))
+
+
+def show_history_order(user_id, order_id):
+    with sqlite3.connect(DB_FILE) as connection:
+        row = connection.execute(
+            "SELECT created_at, result FROM order_history "
+            "WHERE id = ? AND user_id = ?",
+            (int(order_id), str(user_id))
+        ).fetchone()
+
+    if not row:
+        send_message(user_id, "Этот заказ не найден в вашей истории.")
+        return
+
+    created_at, result = row
+    send_message(
+        user_id,
+        f"📋 ЗАКАЗ №{order_id}\nДата: {created_at}\n\n{result}",
+        [[{"type": "callback", "text": "⬅️ К истории заказов", "payload": "history"}],
+         [{"type": "callback", "text": "🏠 Главное меню", "payload": "menu"}]]
+    )
+
+
+init_history_db()
 
 
 # =========================================================
@@ -215,6 +296,11 @@ def main_menu(user_id):
             "type": "callback",
             "text": "🔹 География работ",
             "payload": "location"
+        }],
+        [{
+            "type": "callback",
+            "text": "📋 История заказов",
+            "payload": "history"
         }],
         [{
             "type": "callback",
@@ -537,6 +623,9 @@ def calculate_order(user_id):
 
     result = "\n".join(lines)
 
+    # Сохраняем завершённый расчёт в постоянную историю клиента.
+    save_order_history(user_id, total, result)
+
     # Сохраняем смету для последующего оформления заявки.
     lead_states[uid] = {
         "step": "ready",
@@ -663,6 +752,19 @@ def handle_button(user_id, payload):
 
     if payload == "menu":
         main_menu(user_id)
+        return
+
+    if payload == "history":
+        show_order_history(user_id)
+        return
+
+    if payload.startswith("history_view:"):
+        try:
+            order_id = int(payload.split(":", 1)[1])
+        except ValueError:
+            send_message(user_id, "Некорректный номер заказа.")
+            return
+        show_history_order(user_id, order_id)
         return
 
     if payload == "cancel":
