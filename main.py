@@ -107,6 +107,21 @@ def init_history_db():
             "CREATE INDEX IF NOT EXISTS idx_order_history_user "
             "ON order_history(user_id, id DESC)"
         )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS customer_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                customer_name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                result TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Новая'
+            )
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_customer_requests_status "
+            "ON customer_requests(status, id DESC)"
+        )
 
 
 def save_order_history(user_id, total, result):
@@ -166,6 +181,113 @@ def show_history_order(user_id, order_id):
 
 
 init_history_db()
+
+
+def is_admin(user_id):
+    return bool(ADMIN_USER_ID) and str(user_id) == str(ADMIN_USER_ID)
+
+
+def save_customer_request(user_id, customer_name, phone, result):
+    with sqlite3.connect(DB_FILE) as connection:
+        cursor = connection.execute(
+            "INSERT INTO customer_requests "
+            "(user_id, created_at, customer_name, phone, result, status) "
+            "VALUES (?, ?, ?, ?, ?, 'Новая')",
+            (str(user_id), datetime.now().strftime("%d.%m.%Y %H:%M"),
+             customer_name, phone, result)
+        )
+        return cursor.lastrowid
+
+
+def show_admin_panel(user_id):
+    if not is_admin(user_id):
+        send_message(user_id, "⛔ Доступ запрещён.")
+        return
+    with sqlite3.connect(DB_FILE) as connection:
+        total = connection.execute("SELECT COUNT(*) FROM customer_requests").fetchone()[0]
+        new_count = connection.execute(
+            "SELECT COUNT(*) FROM customer_requests WHERE status = 'Новая'"
+        ).fetchone()[0]
+        work_count = connection.execute(
+            "SELECT COUNT(*) FROM customer_requests WHERE status = 'В работе'"
+        ).fetchone()[0]
+    buttons = [
+        [{"type": "callback", "text": "📥 Все заявки", "payload": "admin_orders"}],
+        [{"type": "callback", "text": "🆕 Новые заявки", "payload": "admin_orders_new"}],
+        [{"type": "callback", "text": "🏠 Главное меню", "payload": "menu"}],
+    ]
+    send_message(user_id,
+        f"🛠 АДМИН-ПАНЕЛЬ\n\nВсего заявок: {total}\nНовых: {new_count}\nВ работе: {work_count}",
+        buttons)
+
+
+def show_admin_orders(user_id, only_new=False):
+    if not is_admin(user_id):
+        send_message(user_id, "⛔ Доступ запрещён.")
+        return
+    query = (
+        "SELECT id, created_at, customer_name, phone, status "
+        "FROM customer_requests WHERE status = 'Новая' ORDER BY id DESC LIMIT 20"
+        if only_new else
+        "SELECT id, created_at, customer_name, phone, status "
+        "FROM customer_requests ORDER BY id DESC LIMIT 20"
+    )
+    with sqlite3.connect(DB_FILE) as connection:
+        rows = connection.execute(query).fetchall()
+    if not rows:
+        send_message(user_id, "Заявок пока нет.", [[{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}]])
+        return
+    lines = ["📥 НОВЫЕ ЗАЯВКИ" if only_new else "📋 ВСЕ ЗАЯВКИ", ""]
+    buttons = []
+    for order_id, created_at, name, phone, status in rows:
+        lines.append(f"№{order_id} — {name} — {status} — {created_at}")
+        buttons.append([{"type": "callback", "text": f"Открыть заявку №{order_id}", "payload": f"admin_order:{order_id}"}])
+    buttons.append([{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}])
+    send_message(user_id, "\n".join(lines), buttons)
+
+
+def show_admin_order(user_id, order_id):
+    if not is_admin(user_id):
+        send_message(user_id, "⛔ Доступ запрещён.")
+        return
+    with sqlite3.connect(DB_FILE) as connection:
+        row = connection.execute(
+            "SELECT user_id, created_at, customer_name, phone, result, status "
+            "FROM customer_requests WHERE id = ?", (int(order_id),)
+        ).fetchone()
+    if not row:
+        send_message(user_id, "Заявка не найдена.")
+        return
+    client_id, created_at, name, phone, result, status = row
+    buttons = [
+        [{"type": "callback", "text": "🆕 Новая", "payload": f"admin_status:{order_id}:Новая"}],
+        [{"type": "callback", "text": "🔧 В работе", "payload": f"admin_status:{order_id}:В работе"}],
+        [{"type": "callback", "text": "✅ Завершена", "payload": f"admin_status:{order_id}:Завершена"}],
+        [{"type": "callback", "text": "⬅️ К списку заявок", "payload": "admin_orders"}],
+    ]
+    send_message(user_id,
+        f"📋 ЗАЯВКА №{order_id}\nДата: {created_at}\nСтатус: {status}\n\n"
+        f"Имя: {name}\nТелефон: {phone}\nID клиента MAX: {client_id}\n\n{result}",
+        buttons)
+
+
+def set_admin_order_status(user_id, order_id, status):
+    if not is_admin(user_id):
+        send_message(user_id, "⛔ Доступ запрещён.")
+        return
+    if status not in ("Новая", "В работе", "Завершена"):
+        send_message(user_id, "Недопустимый статус.")
+        return
+    with sqlite3.connect(DB_FILE) as connection:
+        cursor = connection.execute(
+            "UPDATE customer_requests SET status = ? WHERE id = ?",
+            (status, int(order_id))
+        )
+    if cursor.rowcount:
+        send_message(user_id, f"✅ Статус заявки №{order_id} изменён: {status}")
+        show_admin_order(user_id, order_id)
+    else:
+        send_message(user_id, "Заявка не найдена.")
 
 
 # =========================================================
@@ -308,6 +430,12 @@ def main_menu(user_id):
             "payload": "contact"
         }],
     ]
+    if is_admin(user_id):
+        buttons.append([{
+            "type": "callback",
+            "text": "🛠 Админ-панель",
+            "payload": "admin_panel"
+        }])
 
     send_message(
         user_id,
@@ -710,12 +838,16 @@ def process_lead_message(user_id, text):
             )
             return
 
+        request_id = save_customer_request(
+            user_id, state["name"], phone, state["result"]
+        )
         admin_message = (
-            "📩 НОВАЯ ЗАЯВКА!\n\n"
+            f"📩 НОВАЯ ЗАЯВКА №{request_id}!\n\n"
             f"Имя: {state['name']}\n"
             f"Телефон: {phone}\n"
             f"ID клиента MAX: {user_id}\n\n"
-            f"{state['result']}"
+            f"{state['result']}\n\n"
+            "Откройте админ-панель бота, чтобы изменить статус заявки."
         )
 
         try:
@@ -765,6 +897,35 @@ def handle_button(user_id, payload):
             send_message(user_id, "Некорректный номер заказа.")
             return
         show_history_order(user_id, order_id)
+        return
+
+    if payload == "admin_panel":
+        show_admin_panel(user_id)
+        return
+
+    if payload == "admin_orders":
+        show_admin_orders(user_id)
+        return
+
+    if payload == "admin_orders_new":
+        show_admin_orders(user_id, only_new=True)
+        return
+
+    if payload.startswith("admin_order:"):
+        try:
+            order_id = int(payload.split(":", 1)[1])
+        except ValueError:
+            send_message(user_id, "Некорректный номер заявки.")
+            return
+        show_admin_order(user_id, order_id)
+        return
+
+    if payload.startswith("admin_status:"):
+        try:
+            _, order_id, status = payload.split(":", 2)
+            set_admin_order_status(user_id, int(order_id), status)
+        except ValueError:
+            send_message(user_id, "Некорректные данные статуса.")
         return
 
     if payload == "cancel":
