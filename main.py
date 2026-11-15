@@ -555,24 +555,31 @@ def start_order(user_id):
     ask_position_diameter(user_id)
 
 
+
 def ask_position_diameter(user_id):
     uid = str(user_id)
     state = order_states[uid]
     position_number = len(state["positions"]) + 1
 
     items = [
-        (f"{diameter} мм", f"order_diam:{diameter}")
+        (f"💎 {diameter} мм", f"order_diam:{diameter}")
         for diameter in DIAMETERS
     ]
-    items.append(("Отмена заказа", "cancel"))
+    items.append(("❌ Отмена заказа", "cancel"))
 
     send_message(
         user_id,
-        f"🔹 НОВЫЙ ЗАКАЗ\n\n"
-        f"Позиция №{position_number}\n\n"
-        "Выберите диаметр отверстия:",
+        "💎 MAX | АЛМАЗНОЕ БУРЕНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "НОВЫЙ ЗАКАЗ\n\n"
+        f"📌 ПОЗИЦИЯ №{position_number}\n\n"
+        "📏 ВЫБОР ДИАМЕТРА\n\n"
+        "Выберите необходимый диаметр отверстия:\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО",
         keyboard(items)
     )
+
 
 
 def ask_position_material(user_id):
