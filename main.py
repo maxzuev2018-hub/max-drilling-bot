@@ -92,12 +92,10 @@ order_states = {}
 lead_states = {}
 admin_search_states = set()
 
-# Постоянные расчёты и заявки хранятся в общем хранилище Bothost.
-# После подключения общего хранилища путь /app/shared сохраняется
-# между обновлениями и перезапусками приложения.
-SHARED_DIR = Path("/app/shared")
-SHARED_DIR.mkdir(parents=True, exist_ok=True)
-DB_FILE = SHARED_DIR / "orders_history.sqlite3"
+# Постоянное хранилище Bothost
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_FILE = DATA_DIR / "orders_history.sqlite3"
 logging.info("База заказов и заявок: %s", DB_FILE)
 
 
