@@ -294,7 +294,7 @@ def sync_request_to_google(order_id):
     if not spreadsheet:
         return False
 
-    active_sheet = spreadsheet.worksheet("Активные заявки")
+    active_sheet = spreadsheet.worksheet("Активные")
     archive_sheet = spreadsheet.worksheet("Архив")
     section = "Архив" if archived else "Активная"
     values = [
@@ -318,6 +318,40 @@ def sync_request_to_google(order_id):
         _delete_google_sheet_rows(archive_sheet, request_id)
 
     return True
+
+
+def sync_all_requests_to_google():
+    """Первичная и повторная сверка всех заявок SQLite с Google Таблицей."""
+    try:
+        with sqlite3.connect(DB_FILE) as connection:
+            rows = connection.execute(
+                "SELECT id FROM customer_requests ORDER BY id"
+            ).fetchall()
+
+        if not rows:
+            logging.info("Нет заявок для синхронизации с Google Таблицей")
+            return
+
+        synced = 0
+        failed = 0
+        for (order_id,) in rows:
+            try:
+                if sync_request_to_google(order_id):
+                    synced += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+                logging.exception(
+                    "Ошибка синхронизации заявки №%s", order_id
+                )
+
+        logging.info(
+            "Сверка Google Таблицы завершена: успешно %s, ошибок %s",
+            synced, failed
+        )
+    except Exception:
+        logging.exception("Не удалось выполнить сверку заявок с Google Таблицей")
 
 
 def save_customer_request(user_id, customer_name, phone, result):
@@ -1966,6 +2000,11 @@ if __name__ == "__main__":
 
     threading.Thread(
         target=register_webhook,
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=sync_all_requests_to_google,
         daemon=True
     ).start()
 
