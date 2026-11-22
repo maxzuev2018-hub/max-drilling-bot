@@ -264,11 +264,53 @@ def _upsert_google_sheet_row(worksheet, values):
     if row_number:
         worksheet.update(
             values=[values],
-            range_name=f"A{row_number}:L{row_number}",
+            range_name=f"A{row_number}:K{row_number}",
             value_input_option="USER_ENTERED"
         )
     else:
         worksheet.append_row(values, value_input_option="USER_ENTERED")
+
+
+def combine_object_address(address, legacy_locality=""):
+    """Объединяет адрес и старое отдельное поле района в одну строку."""
+    address = str(address or "").strip()
+    legacy_locality = str(legacy_locality or "").strip()
+
+    if not legacy_locality:
+        return address
+    if not address:
+        return legacy_locality
+    if legacy_locality.casefold() in address.casefold():
+        return address
+    return f"{address}, {legacy_locality}"
+
+
+GOOGLE_SHEET_LAYOUT_LOCK = threading.Lock()
+
+
+def ensure_google_sheet_layout(worksheet):
+    """Убирает устаревший столбец района, сохраняя время связи и комментарий."""
+    # Защита от одновременной миграции листа двумя потоками при запуске бота.
+    with GOOGLE_SHEET_LAYOUT_LOCK:
+        headers = worksheet.row_values(1)
+        if len(headers) >= 10 and str(headers[9]).strip().casefold() in {
+            "район / населённый пункт",
+            "район или населённый пункт"
+        }:
+            # Значения старого поля района остаются в SQLite и объединяются с адресом.
+            worksheet.delete_columns(10)
+            headers = worksheet.row_values(1)
+
+        expected_headers = [
+            "Удобное время для связи",
+            "Комментарий клиента"
+        ]
+        if headers[9:11] != expected_headers:
+            worksheet.update(
+                values=[expected_headers],
+                range_name="J1:K1",
+                value_input_option="RAW"
+            )
 
 
 def _delete_google_sheet_rows(worksheet, order_id):
@@ -338,35 +380,22 @@ def sync_request_to_google(order_id):
     active_sheet = spreadsheet.worksheet("Активные")
     archive_sheet = spreadsheet.worksheet("Архив")
 
-    # Добавляем заголовки новых необязательных полей, не меняя существующие A:I.
-    new_headers = [
-        "Район / населённый пункт",
-        "Удобное время для связи",
-        "Комментарий клиента"
-    ]
+    # Удаляем старую отдельную колонку района: район теперь вводится вместе с адресом.
     for worksheet in (active_sheet, archive_sheet):
-        header_values = worksheet.row_values(1)
-        if len(header_values) < 12 or any(
-            not str(value).strip() for value in header_values[9:12]
-        ):
-            worksheet.update(
-                values=[new_headers],
-                range_name="J1:L1",
-                value_input_option="RAW"
-            )
+        ensure_google_sheet_layout(worksheet)
 
+    full_address = combine_object_address(address, locality)
     section = "Архив" if archived else "Активная"
     values = [
         request_id,
         created_at,
         customer_name,
         phone,
-        address or "",
+        full_address,
         result,
         extract_total_from_result(result),
         status,
         section,
-        locality or "",
         contact_time or "",
         comment or ""
     ]
@@ -418,7 +447,7 @@ def sync_all_requests_to_google():
 
 def save_customer_request(
     user_id, customer_name, phone, result,
-    address="", locality="", contact_time="", comment=""
+    address="", contact_time="", comment=""
 ):
     created_at = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
 
@@ -426,11 +455,11 @@ def save_customer_request(
         cursor = connection.execute(
             "INSERT INTO customer_requests "
             "(user_id, created_at, customer_name, phone, result, status, "
-            "address, locality, contact_time, comment) "
-            "VALUES (?, ?, ?, ?, ?, 'Новая', ?, ?, ?, ?)",
+            "address, contact_time, comment) "
+            "VALUES (?, ?, ?, ?, ?, 'Новая', ?, ?, ?)",
             (
                 str(user_id), created_at, customer_name, phone, result,
-                address, locality, contact_time, comment
+                address, contact_time, comment
             )
         )
         order_id = cursor.lastrowid
@@ -667,10 +696,9 @@ def show_admin_order(user_id, order_id, from_archive=False):
 
     reason_line = f"\nПричина архивации: {reason}" if reason else ""
     optional_lines = []
-    if address:
-        optional_lines.append(f"Адрес объекта: {address}")
-    if locality:
-        optional_lines.append(f"Район / населённый пункт: {locality}")
+    full_address = combine_object_address(address, locality)
+    if full_address:
+        optional_lines.append(f"Адрес объекта: {full_address}")
     if contact_time:
         optional_lines.append(f"Удобное время для связи: {contact_time}")
     if comment:
@@ -1336,7 +1364,6 @@ def start_lead(user_id, result):
         "step": "name",
         "result": result,
         "address": "",
-        "locality": "",
         "contact_time": "",
         "comment": ""
     }
@@ -1378,12 +1405,7 @@ def ask_optional_lead_field(user_id, step):
     prompts = {
         "address": (
             "📍 Адрес объекта\n\n"
-            "Укажите улицу, дом и, если нужно, корпус или помещение.\n"
-            "Это поле необязательное — можно пропустить."
-        ),
-        "locality": (
-            "🏙 Район или населённый пункт\n\n"
-            "Например: Московский район, Пушкин или Всеволожск.\n"
+            "Укажите улицу, дом, район или населённый пункт. При необходимости добавьте корпус, помещение или другие ориентиры.\n"
             "Это поле необязательное — можно пропустить."
         ),
         "contact_time": (
@@ -1416,8 +1438,7 @@ def ask_optional_lead_field(user_id, step):
 
 def advance_optional_lead_field(user_id, current_step):
     next_steps = {
-        "address": "locality",
-        "locality": "contact_time",
+        "address": "contact_time",
         "contact_time": "comment"
     }
     next_step = next_steps.get(current_step)
@@ -1430,7 +1451,7 @@ def advance_optional_lead_field(user_id, current_step):
 def skip_optional_lead_field(user_id, field):
     uid = str(user_id)
     state = lead_states.get(uid)
-    allowed_fields = ("address", "locality", "contact_time", "comment")
+    allowed_fields = ("address", "contact_time", "comment")
 
     if not state or field not in allowed_fields or state.get("step") != field:
         send_message(user_id, "Этот шаг уже завершён. Продолжите оформление заявки.")
@@ -1453,17 +1474,15 @@ def finalize_lead(user_id):
             state["phone"],
             state["result"],
             address=state.get("address", ""),
-            locality=state.get("locality", ""),
             contact_time=state.get("contact_time", ""),
             comment=state.get("comment", "")
         )
 
     request_id = state["request_id"]
     details = []
-    if state.get("address"):
-        details.append(f"📍 Адрес объекта: {state['address']}")
-    if state.get("locality"):
-        details.append(f"🏙 Район / населённый пункт: {state['locality']}")
+    full_address = combine_object_address(state.get("address", ""))
+    if full_address:
+        details.append(f"📍 Адрес объекта: {full_address}")
     if state.get("contact_time"):
         details.append(f"🕒 Удобное время для связи: {state['contact_time']}")
     if state.get("comment"):
@@ -1554,7 +1573,6 @@ def process_lead_message(user_id, text):
 
     field_limits = {
         "address": 300,
-        "locality": 150,
         "contact_time": 150,
         "comment": 1000
     }
