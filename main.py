@@ -173,6 +173,19 @@ def init_history_db():
                 connection.execute(
                     f"ALTER TABLE customer_requests ADD COLUMN {column_name} TEXT"
                 )
+        if "group_notified" not in columns:
+            # Для старых заявок ставим 1, чтобы при первом запуске не рассылать историю.
+            connection.execute(
+                "ALTER TABLE customer_requests "
+                "ADD COLUMN group_notified INTEGER NOT NULL DEFAULT 1"
+            )
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL
+            )
+        """)
 
         # Уже завершённые заявки переводим в архив при первом запуске новой версии.
         connection.execute(
@@ -455,8 +468,8 @@ def save_customer_request(
         cursor = connection.execute(
             "INSERT INTO customer_requests "
             "(user_id, created_at, customer_name, phone, result, status, "
-            "address, contact_time, comment) "
-            "VALUES (?, ?, ?, ?, ?, 'Новая', ?, ?, ?)",
+            "address, contact_time, comment, group_notified) "
+            "VALUES (?, ?, ?, ?, ?, 'Новая', ?, ?, ?, 0)",
             (
                 str(user_id), created_at, customer_name, phone, result,
                 address, contact_time, comment
@@ -839,6 +852,117 @@ def notify_admin(text):
     ]]
 
     send_message(ADMIN_USER_ID, text, buttons)
+
+
+WORK_GROUP_BIND_COMMAND = "!привязать_рабочую_группу"
+GROUP_NOTIFICATIONS_LOCK = threading.Lock()
+
+
+def get_work_group_chat_id():
+    with sqlite3.connect(DB_FILE) as connection:
+        row = connection.execute(
+            "SELECT setting_value FROM bot_settings WHERE setting_key = ?",
+            ("work_group_chat_id",)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def set_work_group_chat_id(chat_id):
+    with sqlite3.connect(DB_FILE) as connection:
+        connection.execute(
+            "INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value",
+            ("work_group_chat_id", str(int(chat_id)))
+        )
+
+
+def clear_work_group_chat_id(chat_id):
+    with sqlite3.connect(DB_FILE) as connection:
+        connection.execute(
+            "DELETE FROM bot_settings WHERE setting_key = ? AND setting_value = ?",
+            ("work_group_chat_id", str(chat_id))
+        )
+
+
+def send_group_message(chat_id, text):
+    # В MAX для группового чата используется query-параметр chat_id, не user_id.
+    response = session.post(
+        f"{API_URL}/messages",
+        headers=HEADERS,
+        params={"chat_id": int(chat_id)},
+        json={"text": text[:3900]},
+        timeout=20
+    )
+    logging.info(
+        "Ответ MAX для рабочей группы %s: %s",
+        chat_id,
+        response.status_code
+    )
+    response.raise_for_status()
+
+
+def format_group_request(row):
+    order_id, created_at, name, phone, result, address, locality, contact_time, comment = row
+    details = [
+        f"📥 НОВАЯ ЗАЯВКА №{order_id}",
+        f"📅 Дата: {created_at}",
+        f"👤 Клиент: {name}",
+        f"📞 Телефон: {phone}"
+    ]
+    full_address = combine_object_address(address, locality)
+    if full_address:
+        details.append(f"📍 Адрес объекта: {full_address}")
+    if contact_time:
+        details.append(f"🕒 Удобное время для связи: {contact_time}")
+    if comment:
+        details.append(f"💬 Комментарий клиента: {comment}")
+    details.extend([
+        "",
+        str(result or "Заявка без предварительного расчёта."),
+        "",
+        "💬 Обсудите заказ в этом рабочем чате. Номер заявки сохранён в боте."
+    ])
+    message = "\n".join(details)
+    if len(message) > 3900:
+        message = message[:3800] + "\n\n… Полный расчёт сохранён в карточке заявки бота."
+    return message
+
+
+def sync_pending_group_notifications():
+    """Отправляет в рабочую группу новые заявки, ещё не отмеченные как доставленные."""
+    chat_id = get_work_group_chat_id()
+    if not chat_id:
+        return
+
+    # Не допускаем параллельной отправки одной очереди из разных потоков.
+    with GROUP_NOTIFICATIONS_LOCK:
+        with sqlite3.connect(DB_FILE) as connection:
+            rows = connection.execute(
+                "SELECT id, created_at, customer_name, phone, result, address, "
+                "locality, contact_time, comment "
+                "FROM customer_requests WHERE group_notified = 0 ORDER BY id"
+            ).fetchall()
+
+        for row in rows:
+            order_id = row[0]
+            try:
+                send_group_message(chat_id, format_group_request(row))
+            except Exception:
+                logging.exception(
+                    "Не удалось отправить заявку №%s в рабочую группу; она останется в очереди",
+                    order_id
+                )
+                break
+
+            with sqlite3.connect(DB_FILE) as connection:
+                connection.execute(
+                    "UPDATE customer_requests SET group_notified = 1 "
+                    "WHERE id = ? AND group_notified = 0",
+                    (order_id,)
+                )
+            # Документация MAX ограничивает отправку двумя сообщениями в секунду в один чат.
+            if len(rows) > 1:
+                time.sleep(0.55)
 
 
 def keyboard(items, columns=2):
@@ -1501,9 +1625,11 @@ def finalize_lead(user_id):
         "Откройте админ-панель бота, чтобы изменить статус заявки."
     )
 
+    admin_notification_failed = False
     try:
         notify_admin(admin_message)
     except Exception:
+        admin_notification_failed = True
         logging.exception("Не удалось отправить заявку администратору")
         state["step"] = "notify_retry"
         send_message(
@@ -1517,6 +1643,15 @@ def finalize_lead(user_id):
                 "payload": "lead_retry_notification"
             }]]
         )
+
+    # Групповое уведомление отправляется независимо от личного уведомления.
+    # Если группа ещё не привязана или MAX временно недоступен, заявка остаётся в очереди.
+    try:
+        sync_pending_group_notifications()
+    except Exception:
+        logging.exception("Ошибка отправки новых заявок в рабочую группу")
+
+    if admin_notification_failed:
         return
 
     lead_states.pop(uid, None)
@@ -2038,6 +2173,22 @@ def handle_update(update):
     update_type = update.get("update_type")
     logging.info("Получено событие MAX: %s", update_type)
 
+    if update_type == "bot_added":
+        if not update.get("is_channel", False):
+            logging.info(
+                "Бот добавлен в групповой чат. chat_id=%s. "
+                "Для привязки отправьте администратором команду %s",
+                update.get("chat_id"), WORK_GROUP_BIND_COMMAND
+            )
+        return
+
+    if update_type == "bot_removed":
+        removed_chat_id = update.get("chat_id")
+        if removed_chat_id and str(get_work_group_chat_id()) == str(removed_chat_id):
+            clear_work_group_chat_id(removed_chat_id)
+            logging.warning("Бот удалён из рабочей группы; привязка очищена")
+        return
+
     if update_type == "bot_started":
         user_id = update.get("user", {}).get("user_id")
         if user_id:
@@ -2059,8 +2210,37 @@ def handle_update(update):
 
     message = update.get("message", {})
     sender = message.get("sender", {})
+    recipient = message.get("recipient", {})
     user_id = sender.get("user_id")
     text = message.get("body", {}).get("text", "")
+    text = str(text or "").strip()
+
+    # Сообщения рабочей группы не должны попадать в личный сценарий клиента.
+    if recipient.get("chat_type") == "chat":
+        chat_id = recipient.get("chat_id") or update.get("chat_id")
+        command = text.casefold()
+        if (
+            user_id is not None
+            and ADMIN_USER_ID
+            and str(user_id) == str(ADMIN_USER_ID)
+            and command == WORK_GROUP_BIND_COMMAND.casefold()
+        ):
+            if not chat_id:
+                logging.error("Не удалось определить chat_id рабочей группы")
+                return
+            try:
+                # Проверяем возможность отправки до сохранения ID группы.
+                send_group_message(
+                    chat_id,
+                    "✅ Рабочая группа подключена к боту «Алмазное бурение».\n"
+                    "Новые заявки будут автоматически появляться здесь."
+                )
+                set_work_group_chat_id(chat_id)
+                logging.info("Рабочая группа успешно привязана: chat_id=%s", chat_id)
+                sync_pending_group_notifications()
+            except Exception:
+                logging.exception("Не удалось подключить рабочую группу chat_id=%s", chat_id)
+        return
 
     logging.info("ID пользователя MAX: %s", user_id)
 
@@ -2068,7 +2248,6 @@ def handle_update(update):
         return
 
     uid = str(user_id)
-    text = text.strip()
 
     # Поисковый запрос администратора обрабатываем до остальных текстовых сценариев.
     if uid in admin_search_states:
@@ -2184,6 +2363,8 @@ def register_webhook():
     payload = {
         "url": WEBHOOK_URL,
         "update_types": [
+            "bot_added",
+            "bot_removed",
             "bot_started",
             "message_created",
             "message_callback"
@@ -2228,6 +2409,11 @@ if __name__ == "__main__":
 
     threading.Thread(
         target=sync_all_requests_to_google,
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=sync_pending_group_notifications,
         daemon=True
     ).start()
 
