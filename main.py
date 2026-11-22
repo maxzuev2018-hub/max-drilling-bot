@@ -168,6 +168,11 @@ def init_history_db():
             connection.execute(
                 "ALTER TABLE customer_requests ADD COLUMN archive_reason TEXT"
             )
+        for column_name in ("address", "locality", "contact_time", "comment"):
+            if column_name not in columns:
+                connection.execute(
+                    f"ALTER TABLE customer_requests ADD COLUMN {column_name} TEXT"
+                )
 
         # Уже завершённые заявки переводим в архив при первом запуске новой версии.
         connection.execute(
@@ -259,7 +264,7 @@ def _upsert_google_sheet_row(worksheet, values):
     if row_number:
         worksheet.update(
             values=[values],
-            range_name=f"A{row_number}:I{row_number}",
+            range_name=f"A{row_number}:L{row_number}",
             value_input_option="USER_ENTERED"
         )
     else:
@@ -315,32 +320,55 @@ def sync_request_to_google(order_id):
     """Синхронизирует одну заявку из SQLite в нужный лист Google Таблицы."""
     with sqlite3.connect(DB_FILE) as connection:
         row = connection.execute(
-            "SELECT id, created_at, customer_name, phone, result, status, "
-            "archived FROM customer_requests WHERE id = ?",
+            "SELECT id, created_at, customer_name, phone, result, status, archived, "
+            "address, locality, contact_time, comment "
+            "FROM customer_requests WHERE id = ?",
             (int(order_id),)
         ).fetchone()
 
     if not row:
         return False
 
-    request_id, created_at, customer_name, phone, result, status, archived = row
+    request_id, created_at, customer_name, phone, result, status, archived, \
+        address, locality, contact_time, comment = row
     spreadsheet = connect_google_sheets()
     if not spreadsheet:
         return False
 
     active_sheet = spreadsheet.worksheet("Активные")
     archive_sheet = spreadsheet.worksheet("Архив")
+
+    # Добавляем заголовки новых необязательных полей, не меняя существующие A:I.
+    new_headers = [
+        "Район / населённый пункт",
+        "Удобное время для связи",
+        "Комментарий клиента"
+    ]
+    for worksheet in (active_sheet, archive_sheet):
+        header_values = worksheet.row_values(1)
+        if len(header_values) < 12 or any(
+            not str(value).strip() for value in header_values[9:12]
+        ):
+            worksheet.update(
+                values=[new_headers],
+                range_name="J1:L1",
+                value_input_option="RAW"
+            )
+
     section = "Архив" if archived else "Активная"
     values = [
         request_id,
         created_at,
         customer_name,
         phone,
-        "",       # Адрес пока не собирается формой заявки.
+        address or "",
         result,
         extract_total_from_result(result),
         status,
-        section
+        section,
+        locality or "",
+        contact_time or "",
+        comment or ""
     ]
 
     if archived:
@@ -388,15 +416,22 @@ def sync_all_requests_to_google():
         logging.exception("Не удалось выполнить сверку заявок с Google Таблицей")
 
 
-def save_customer_request(user_id, customer_name, phone, result):
+def save_customer_request(
+    user_id, customer_name, phone, result,
+    address="", locality="", contact_time="", comment=""
+):
     created_at = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
 
     with sqlite3.connect(DB_FILE) as connection:
         cursor = connection.execute(
             "INSERT INTO customer_requests "
-            "(user_id, created_at, customer_name, phone, result, status) "
-            "VALUES (?, ?, ?, ?, ?, 'Новая')",
-            (str(user_id), created_at, customer_name, phone, result)
+            "(user_id, created_at, customer_name, phone, result, status, "
+            "address, locality, contact_time, comment) "
+            "VALUES (?, ?, ?, ?, ?, 'Новая', ?, ?, ?, ?)",
+            (
+                str(user_id), created_at, customer_name, phone, result,
+                address, locality, contact_time, comment
+            )
         )
         order_id = cursor.lastrowid
 
@@ -602,14 +637,18 @@ def show_admin_order(user_id, order_id, from_archive=False):
     with sqlite3.connect(DB_FILE) as connection:
         row = connection.execute(
             "SELECT user_id, created_at, customer_name, phone, result, status, "
-            "archived, archive_reason FROM customer_requests WHERE id = ?",
+            "archived, archive_reason, address, locality, contact_time, comment "
+            "FROM customer_requests WHERE id = ?",
             (int(order_id),)
         ).fetchone()
     if not row:
         send_message(user_id, "Заявка не найдена.")
         return
 
-    client_id, created_at, name, phone, result, status, archived, reason = row
+    (
+        client_id, created_at, name, phone, result, status, archived, reason,
+        address, locality, contact_time, comment
+    ) = row
     section = "Архив" if archived else "Активные заявки"
     buttons = [
         [{"type": "callback", "text": "🆕 Новая", "payload": f"admin_status:{order_id}:Новая"}],
@@ -627,11 +666,24 @@ def show_admin_order(user_id, order_id, from_archive=False):
     buttons.append([{"type": "callback", "text": back_text, "payload": back_payload}])
 
     reason_line = f"\nПричина архивации: {reason}" if reason else ""
+    optional_lines = []
+    if address:
+        optional_lines.append(f"Адрес объекта: {address}")
+    if locality:
+        optional_lines.append(f"Район / населённый пункт: {locality}")
+    if contact_time:
+        optional_lines.append(f"Удобное время для связи: {contact_time}")
+    if comment:
+        optional_lines.append(f"Комментарий клиента: {comment}")
+    optional_details = "\n".join(optional_lines)
+    optional_block = f"\n\nДополнительная информация:\n{optional_details}" if optional_details else ""
+
     send_message(
         user_id,
         f"📋 ЗАЯВКА №{order_id}\nДата: {created_at}\nСтатус: {status}"
         f"\nРаздел: {section}{reason_line}\n\n"
-        f"Имя: {name}\nТелефон: {phone}\nID клиента MAX: {client_id}\n\n{result}",
+        f"Имя: {name}\nТелефон: {phone}\nID клиента MAX: {client_id}"
+        f"{optional_block}\n\n{result}",
         buttons
     )
 
@@ -1282,7 +1334,11 @@ def start_lead(user_id, result):
 
     lead_states[uid] = {
         "step": "name",
-        "result": result
+        "result": result,
+        "address": "",
+        "locality": "",
+        "contact_time": "",
+        "comment": ""
     }
 
     send_message(
@@ -1292,13 +1348,11 @@ def start_lead(user_id, result):
         "📩 ОФОРМЛЕНИЕ ЗАЯВКИ\n\n"
         "Благодарим за обращение!\n\n"
         "Чтобы наш менеджер мог связаться с вами, "
-        "пожалуйста, укажите ваше имя.\n\n"
+        "пожалуйста, укажите ваше имя."
     )
 
 
-
 def ask_lead_phone(user_id):
-
     uid = str(user_id)
     lead_states[uid]["step"] = "phone"
 
@@ -1310,103 +1364,224 @@ def ask_lead_phone(user_id):
         "Укажите номер телефона, по которому "
         "наш менеджер сможет связаться с вами.\n\n"
         "Например: +79991234567\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "ВАША ЗАЯВКА • НАШЕ ВНИМАНИЕ"
+        "Этот номер обязателен для обратной связи."
     )
 
 
+def ask_optional_lead_field(user_id, step):
+    """Показывает необязательное поле заявки с кнопкой пропуска."""
+    uid = str(user_id)
+    state = lead_states.get(uid)
+    if not state:
+        return
+
+    prompts = {
+        "address": (
+            "📍 Адрес объекта\n\n"
+            "Укажите улицу, дом и, если нужно, корпус или помещение.\n"
+            "Это поле необязательное — можно пропустить."
+        ),
+        "locality": (
+            "🏙 Район или населённый пункт\n\n"
+            "Например: Московский район, Пушкин или Всеволожск.\n"
+            "Это поле необязательное — можно пропустить."
+        ),
+        "contact_time": (
+            "🕒 Удобное время для связи\n\n"
+            "Например: после 18:00 или в будние дни с 10:00 до 17:00.\n"
+            "Это поле необязательное — можно пропустить."
+        ),
+        "comment": (
+            "💬 Комментарий к заявке\n\n"
+            "Можете добавить пожелания или важные подробности.\n"
+            "Это поле необязательное — можно пропустить."
+        )
+    }
+
+    if step not in prompts:
+        logging.error("Неизвестный шаг необязательной заявки: %s", step)
+        return
+
+    state["step"] = step
+    send_message(
+        user_id,
+        prompts[step],
+        [[{
+            "type": "callback",
+            "text": "Пропустить",
+            "payload": f"lead_skip:{step}"
+        }]]
+    )
+
+
+def advance_optional_lead_field(user_id, current_step):
+    next_steps = {
+        "address": "locality",
+        "locality": "contact_time",
+        "contact_time": "comment"
+    }
+    next_step = next_steps.get(current_step)
+    if next_step:
+        ask_optional_lead_field(user_id, next_step)
+    else:
+        finalize_lead(user_id)
+
+
+def skip_optional_lead_field(user_id, field):
+    uid = str(user_id)
+    state = lead_states.get(uid)
+    allowed_fields = ("address", "locality", "contact_time", "comment")
+
+    if not state or field not in allowed_fields or state.get("step") != field:
+        send_message(user_id, "Этот шаг уже завершён. Продолжите оформление заявки.")
+        return
+
+    state[field] = ""
+    advance_optional_lead_field(user_id, field)
+
+
+def finalize_lead(user_id):
+    uid = str(user_id)
+    state = lead_states.get(uid)
+    if not state:
+        return
+
+    if not state.get("request_id"):
+        state["request_id"] = save_customer_request(
+            user_id,
+            state["name"],
+            state["phone"],
+            state["result"],
+            address=state.get("address", ""),
+            locality=state.get("locality", ""),
+            contact_time=state.get("contact_time", ""),
+            comment=state.get("comment", "")
+        )
+
+    request_id = state["request_id"]
+    details = []
+    if state.get("address"):
+        details.append(f"📍 Адрес объекта: {state['address']}")
+    if state.get("locality"):
+        details.append(f"🏙 Район / населённый пункт: {state['locality']}")
+    if state.get("contact_time"):
+        details.append(f"🕒 Удобное время для связи: {state['contact_time']}")
+    if state.get("comment"):
+        details.append(f"💬 Комментарий клиента: {state['comment']}")
+    details_text = "\n".join(details)
+    details_block = f"\n\n{details_text}" if details_text else ""
+
+    admin_message = (
+        f"💎 НОВАЯ ЗАЯВКА №{request_id}\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Имя: {state['name']}\n"
+        f"📞 Телефон: {state['phone']}\n"
+        f"🆔 ID клиента MAX: {user_id}"
+        f"{details_block}\n\n"
+        f"{state['result']}\n\n"
+        "Откройте админ-панель бота, чтобы изменить статус заявки."
+    )
+
+    try:
+        notify_admin(admin_message)
+    except Exception:
+        logging.exception("Не удалось отправить заявку администратору")
+        state["step"] = "notify_retry"
+        send_message(
+            user_id,
+            "⚠️ Заявка сохранена, но уведомление менеджеру не отправлено. "
+            "Нажмите кнопку ниже, чтобы повторить отправку.\n\n"
+            "Повторная отправка не создаст дубликат заявки.",
+            [[{
+                "type": "callback",
+                "text": "🔄 Повторить отправку",
+                "payload": "lead_retry_notification"
+            }]]
+        )
+        return
+
+    lead_states.pop(uid, None)
+    send_message(
+        user_id,
+        "💎  АЛМАЗНОЕ БУРЕНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "✅ ВАША ЗАЯВКА ОТПРАВЛЕНА!\n\n"
+        "Благодарим за обращение.\n"
+        "Наш менеджер свяжется с вами "
+        "в ближайшее время.",
+        [[{
+            "type": "callback",
+            "text": "🏠 Главное меню",
+            "payload": "menu"
+        }]]
+    )
 
 
 def process_lead_message(user_id, text):
-
     uid = str(user_id)
-    state = lead_states[uid]
+    state = lead_states.get(uid)
+    if not state:
+        return
 
-    if state["step"] == "name":
+    step = state.get("step")
+
+    if step == "name":
         name = text.strip()
-
         if len(name) < 2:
             send_message(
                 user_id,
-                "💎  АЛМАЗНОЕ БУРЕНИЕ\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
                 "⚠️ Пожалуйста, введите корректное имя.\n"
                 "Имя должно содержать не менее двух символов."
             )
             return
-
         state["name"] = name
         ask_lead_phone(user_id)
         return
 
-    if state["step"] == "phone":
+    if step == "phone":
         phone = text.strip()
         digits = "".join(filter(str.isdigit, phone))
-
         if len(digits) < 10 or len(digits) > 15:
             send_message(
                 user_id,
-                "💎  АЛМАЗНОЕ БУРЕНИЕ\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "⚠️ Некорректный номер телефона.\n"
-                "Пожалуйста, проверьте номер и отправьте его ещё раз.\n\n"
+                "⚠️ Некорректный номер телефона. Проверьте номер и отправьте его ещё раз.\n"
                 "Например: +79991234567"
             )
             return
-
         state["phone"] = phone
+        ask_optional_lead_field(user_id, "address")
+        return
 
-        if not state.get("request_id"):
-            state["request_id"] = save_customer_request(
-                user_id, state["name"], phone, state["result"]
-            )
-
-        request_id = state["request_id"]
-
-        admin_message = (
-            f"💎 НОВАЯ ЗАЯВКА №{request_id}\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            f"👤 Имя: {state['name']}\n"
-            f"📞 Телефон: {phone}\n"
-            f"🆔 ID клиента MAX: {user_id}\n\n"
-            f"{state['result']}\n\n"
-            "Откройте админ-панель бота, чтобы изменить статус заявки."
-        )
-
-        try:
-            notify_admin(admin_message)
-        except Exception:
-            logging.exception("Не удалось отправить заявку администратору")
+    field_limits = {
+        "address": 300,
+        "locality": 150,
+        "contact_time": 150,
+        "comment": 1000
+    }
+    if step in field_limits:
+        value = text.strip()
+        if not value:
             send_message(
                 user_id,
-                "💎  АЛМАЗНОЕ БУРЕНИЕ\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "⚠️ Заявка сохранена, но уведомление менеджеру "
-                "не отправлено.\n"
-                "Отправьте номер телефона ещё раз, чтобы повторить "
-                "уведомление. Новая заявка создана не будет."
+                "Введите текст или нажмите «Пропустить»."
             )
             return
+        if len(value) > field_limits[step]:
+            send_message(
+                user_id,
+                f"Слишком длинный ответ. Максимум для этого поля — {field_limits[step]} символов."
+            )
+            return
+        state[step] = value
+        advance_optional_lead_field(user_id, step)
+        return
 
-        lead_states.pop(uid, None)
-
+    if step == "notify_retry":
         send_message(
             user_id,
-            "💎  АЛМАЗНОЕ БУРЕНИЕ\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "✅ ВАША ЗАЯВКА ОТПРАВЛЕНА!\n\n"
-            "Благодарим за обращение.\n"
-            "Наш менеджер свяжется с вами "
-            "в ближайшее время.\n\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "ТОЧНОСТЬ • НАДЁЖНОСТЬ • КАЧЕСТВО",
-            [[{
-                "type": "callback",
-                "text": "🏠 Главное меню",
-                "payload": "menu"
-            }]]
+            "Заявка уже сохранена. Нажмите кнопку «Повторить отправку», "
+            "чтобы снова уведомить менеджера."
         )
-
 
 
 # =========================================================
@@ -1431,6 +1606,19 @@ def handle_button(user_id, payload):
             send_message(user_id, "Некорректный номер заказа.")
             return
         show_history_order(user_id, order_id)
+        return
+
+    if payload.startswith("lead_skip:"):
+        field = payload.split(":", 1)[1]
+        skip_optional_lead_field(user_id, field)
+        return
+
+    if payload == "lead_retry_notification":
+        state = lead_states.get(uid)
+        if not state or state.get("step") != "notify_retry":
+            send_message(user_id, "Нет уведомления, которое нужно повторить.")
+            return
+        finalize_lead(user_id)
         return
 
     if payload == "admin_panel":
@@ -1913,7 +2101,7 @@ def handle_update(update):
 
             return
 
-    # Затем обрабатываем имя и телефон заявки.
+    # Затем обрабатываем имя, телефон и необязательные поля заявки.
     if uid in lead_states:
         state = lead_states[uid]
 
