@@ -451,7 +451,15 @@ def notify_admin(text):
     if not ADMIN_USER_ID:
         raise RuntimeError("Не задан ADMIN_USER_ID")
 
-    send_message(ADMIN_USER_ID, text)
+    buttons = [[
+        {
+            "type": "callback",
+            "text": "⚙️ Открыть админ-панель",
+            "payload": "admin_panel"
+        }
+    ]]
+
+    send_message(ADMIN_USER_ID, text, buttons)
 
 
 def keyboard(items, columns=2):
