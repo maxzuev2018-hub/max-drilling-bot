@@ -237,6 +237,7 @@ def show_admin_panel(user_id):
     )
 
 
+
 def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
     if not is_admin(user_id):
         send_message(user_id, "⛔ Доступ запрещён.")
@@ -244,37 +245,51 @@ def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
 
     if only_new:
         status = "Новая"
+
     conditions = []
     params = []
+
     if status:
         conditions.append("status = ?")
         params.append(status)
-    if search_term:
-        conditions.append("(customer_name LIKE ? OR phone LIKE ? OR CAST(id AS TEXT) LIKE ?)")
-        pattern = f"%{search_term}%"
-        params.extend([pattern, pattern, pattern])
 
     query = (
         "SELECT id, created_at, customer_name, phone, status "
         "FROM customer_requests"
     )
+
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY id DESC LIMIT 20"
+
+    query += " ORDER BY id DESC"
 
     with sqlite3.connect(DB_FILE) as connection:
         rows = connection.execute(query, params).fetchall()
 
     if search_term:
+        term = search_term.strip().casefold()
+
+        rows = [
+            row for row in rows
+            if term in str(row[2] or "").casefold()
+            or term in str(row[3] or "").casefold()
+            or term in str(row[0])
+        ]
+
+        rows = rows[:20]
+
         title = f"🔎 РЕЗУЛЬТАТЫ ПОИСКА: {search_term}"
-    elif status == "Новая":
-        title = "🆕 НОВЫЕ ЗАЯВКИ"
-    elif status == "В работе":
-        title = "🔧 ЗАЯВКИ В РАБОТЕ"
-    elif status == "Завершена":
-        title = "✅ ЗАВЕРШЁННЫЕ ЗАЯВКИ"
     else:
-        title = "📋 ВСЕ ЗАЯВКИ"
+        rows = rows[:20]
+
+        if status == "Новая":
+            title = "🆕 НОВЫЕ ЗАЯВКИ"
+        elif status == "В работе":
+            title = "🔧 ЗАЯВКИ В РАБОТЕ"
+        elif status == "Завершена":
+            title = "✅ ЗАВЕРШЁННЫЕ ЗАЯВКИ"
+        else:
+            title = "📋 ВСЕ ЗАЯВКИ"
 
     if not rows:
         buttons = [
@@ -286,18 +301,24 @@ def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
 
     lines = [title, "", "Показаны последние 20 подходящих заявок:"]
     buttons = []
+
     for order_id, created_at, name, phone, order_status in rows:
-        lines.append(f"№{order_id} — {name} — {phone} — {order_status} — {created_at}")
+        lines.append(
+            f"№{order_id} — {name} — {phone} — {order_status} — {created_at}"
+        )
         buttons.append([{
             "type": "callback",
             "text": f"Открыть заявку №{order_id}",
             "payload": f"admin_order:{order_id}"
         }])
+
     buttons.extend([
         [{"type": "callback", "text": "🔎 Поиск", "payload": "admin_search"}],
         [{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}],
     ])
+
     send_message(user_id, "\n".join(lines), buttons)
+
 
 
 def start_admin_search(user_id):
