@@ -103,28 +103,40 @@ GOOGLE_SHEET_ID = "1H9wwHnRb4-EWDrJPtd66U48miw9HfIuDZzP4krzyo3o"
 logging.info("База заказов и заявок: %s", DB_FILE)
 
 
+# Повторно используем одно подключение и объект таблицы в течение жизни процесса.
+# Без кэша open_by_key() заново запрашивал метаданные таблицы для каждой заявки.
+GOOGLE_CONNECTION_LOCK = threading.RLock()
+GOOGLE_SPREADSHEET_CACHE = None
+
+
 def connect_google_sheets():
-    try:
-        credentials_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    global GOOGLE_SPREADSHEET_CACHE
 
-        if not credentials_json:
-            logging.error("Не задан GOOGLE_SERVICE_ACCOUNT_JSON")
+    with GOOGLE_CONNECTION_LOCK:
+        if GOOGLE_SPREADSHEET_CACHE is not None:
+            return GOOGLE_SPREADSHEET_CACHE
+
+        try:
+            credentials_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+            if not credentials_json:
+                logging.error("Не задан GOOGLE_SERVICE_ACCOUNT_JSON")
+                return None
+
+            credentials_data = json.loads(credentials_json)
+            credentials = Credentials.from_service_account_info(
+                credentials_data,
+                scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            )
+
+            client = gspread.authorize(credentials)
+            GOOGLE_SPREADSHEET_CACHE = client.open_by_key(GOOGLE_SHEET_ID)
+            logging.info("Google Таблица успешно подключена (подключение сохранено в кэше)")
+            return GOOGLE_SPREADSHEET_CACHE
+
+        except Exception:
+            logging.exception("Ошибка подключения Google Таблиц")
             return None
-
-        credentials_data = json.loads(credentials_json)
-        credentials = Credentials.from_service_account_info(
-            credentials_data,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-
-        client = gspread.authorize(credentials)
-        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
-        logging.info("Google Таблица успешно подключена")
-        return spreadsheet
-
-    except Exception:
-        logging.exception("Ошибка подключения Google Таблиц")
-        return None
 
 
 def init_history_db():
@@ -306,12 +318,17 @@ def combine_object_address(address, legacy_locality=""):
 
 
 GOOGLE_SHEET_LAYOUT_LOCK = threading.Lock()
+GOOGLE_SHEET_LAYOUT_READY = set()
 
 
 def ensure_google_sheet_layout(worksheet):
-    """Убирает устаревший столбец района, сохраняя время связи и комментарий."""
-    # Защита от одновременной миграции листа двумя потоками при запуске бота.
+    """Проверяет заголовки один раз для каждого листа за время работы процесса."""
+    # После первой успешной проверки не читаем строку заголовков при каждой заявке.
+    layout_key = f"{GOOGLE_SHEET_ID}:{worksheet.id}"
     with GOOGLE_SHEET_LAYOUT_LOCK:
+        if layout_key in GOOGLE_SHEET_LAYOUT_READY:
+            return
+
         headers = worksheet.row_values(1)
         if len(headers) >= 10 and str(headers[9]).strip().casefold() in {
             "район / населённый пункт",
@@ -332,6 +349,9 @@ def ensure_google_sheet_layout(worksheet):
                 range_name="J1:L1",
                 value_input_option="RAW"
             )
+
+        # Отмечаем лист готовым только после успешных операций Google Sheets.
+        GOOGLE_SHEET_LAYOUT_READY.add(layout_key)
 
 
 def _delete_google_sheet_rows(worksheet, order_id):
