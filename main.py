@@ -108,6 +108,52 @@ logging.info("База заказов и заявок: %s", DB_FILE)
 GOOGLE_CONNECTION_LOCK = threading.RLock()
 GOOGLE_SPREADSHEET_CACHE = None
 
+# Синхронизации выполняются последовательно, а временные ошибки Google
+# повторяются с увеличивающейся паузой.
+GOOGLE_SYNC_LOCK = threading.RLock()
+GOOGLE_SYNC_RETRY_DELAYS = (5, 15)
+GOOGLE_SYNC_RETRY_INTERVAL = 60
+
+
+def _is_retryable_google_error(error):
+    """Определяет временные ошибки Google/API и сетевые сбои."""
+    if isinstance(error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code in (408, 429, 500, 502, 503, 504):
+        return True
+
+    # Некоторые квотные ошибки Sheets возвращаются как HTTP 403.
+    if status_code == 403 and response is not None:
+        try:
+            error_text = json.dumps(response.json(), ensure_ascii=False).casefold()
+        except Exception:
+            error_text = str(error).casefold()
+        if any(marker in error_text for marker in (
+            "ratelimitexceeded",
+            "userratelimitexceeded",
+            "quotaexceeded",
+            "backenderror",
+        )):
+            return True
+
+    return False
+
+
+def _google_retry_delay(error, fallback_seconds):
+    """Учитывает Retry-After от Google, если заголовок присутствует."""
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after:
+        try:
+            return min(60, max(1, int(float(retry_after))))
+        except (TypeError, ValueError):
+            pass
+    return fallback_seconds
+
 
 def connect_google_sheets():
     global GOOGLE_SPREADSHEET_CACHE
@@ -134,7 +180,12 @@ def connect_google_sheets():
             logging.info("Google Таблица успешно подключена (подключение сохранено в кэше)")
             return GOOGLE_SPREADSHEET_CACHE
 
-        except Exception:
+        except Exception as exc:
+            if _is_retryable_google_error(exc):
+                logging.warning(
+                    "Временная ошибка подключения к Google Таблицам: %s", exc
+                )
+                raise
             logging.exception("Ошибка подключения Google Таблиц")
             return None
 
@@ -198,6 +249,13 @@ def init_history_db():
                 "ALTER TABLE customer_requests "
                 "ADD COLUMN photos TEXT NOT NULL DEFAULT '[]'"
             )
+        if "google_synced" not in columns:
+            # Ноль означает, что заявку ещё нужно доставить в Google Таблицу.
+            # Старые заявки тоже попадут в безопасную стартовую сверку.
+            connection.execute(
+                "ALTER TABLE customer_requests "
+                "ADD COLUMN google_synced INTEGER NOT NULL DEFAULT 0"
+            )
 
         connection.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
@@ -209,13 +267,19 @@ def init_history_db():
         # Уже завершённые заявки переводим в архив при первом запуске новой версии.
         connection.execute(
             "UPDATE customer_requests "
-            "SET archived = 1, archive_reason = COALESCE(archive_reason, 'Завершена') "
+            "SET archived = 1, "
+            "archive_reason = COALESCE(archive_reason, 'Завершена'), "
+            "google_synced = 0 "
             "WHERE status = 'Завершена' AND archived = 0"
         )
 
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_customer_requests_archive_status "
             "ON customer_requests(archived, status, id DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_customer_requests_google_synced "
+            "ON customer_requests(google_synced, id)"
         )
 
 
@@ -417,8 +481,8 @@ def extract_total_from_result(result):
     return ""
 
 
-def sync_request_to_google(order_id):
-    """Синхронизирует одну заявку из SQLite в нужный лист Google Таблицы."""
+def _sync_request_to_google_once(order_id):
+    """Выполняет одну попытку синхронизации заявки с Google Таблицей."""
     with sqlite3.connect(DB_FILE) as connection:
         row = connection.execute(
             "SELECT id, created_at, customer_name, phone, result, status, archived, "
@@ -472,12 +536,64 @@ def sync_request_to_google(order_id):
     return True
 
 
+def sync_request_to_google(order_id):
+    """Синхронизирует заявку с повторами и отмечает её доставленной."""
+    order_id = int(order_id)
+    with GOOGLE_SYNC_LOCK:
+        # Если другой поток уже успел синхронизировать заявку, второй раз
+        # не обращаемся к Google API.
+        with sqlite3.connect(DB_FILE) as connection:
+            state = connection.execute(
+                "SELECT google_synced FROM customer_requests WHERE id = ?",
+                (order_id,)
+            ).fetchone()
+
+        if not state:
+            return False
+        if state[0]:
+            return True
+
+        retry_delays = GOOGLE_SYNC_RETRY_DELAYS
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                synced = _sync_request_to_google_once(order_id)
+                if not synced:
+                    return False
+
+                with sqlite3.connect(DB_FILE) as connection:
+                    connection.execute(
+                        "UPDATE customer_requests SET google_synced = 1 WHERE id = ?",
+                        (order_id,)
+                    )
+                logging.info("Заявка №%s синхронизирована с Google Таблицей", order_id)
+                return True
+
+            except Exception as exc:
+                if not _is_retryable_google_error(exc) or attempt >= len(retry_delays):
+                    logging.exception(
+                        "Синхронизация заявки №%s не удалась после %s попыток",
+                        order_id, attempt + 1
+                    )
+                    return False
+
+                delay = _google_retry_delay(exc, retry_delays[attempt])
+                logging.warning(
+                    "Временная ошибка Google при синхронизации заявки №%s "
+                    "(попытка %s из %s). Повтор через %s сек.: %s",
+                    order_id, attempt + 1, len(retry_delays) + 1, delay, exc
+                )
+                time.sleep(delay)
+
+    return False
+
+
 def sync_all_requests_to_google():
-    """Первичная и повторная сверка всех заявок SQLite с Google Таблицей."""
+    """Синхронизирует только заявки, которые ещё не подтверждены Google."""
     try:
         with sqlite3.connect(DB_FILE) as connection:
             rows = connection.execute(
-                "SELECT id FROM customer_requests ORDER BY id"
+                "SELECT id FROM customer_requests "
+                "WHERE google_synced = 0 ORDER BY id"
             ).fetchall()
 
         if not rows:
@@ -504,6 +620,26 @@ def sync_all_requests_to_google():
         )
     except Exception:
         logging.exception("Не удалось выполнить сверку заявок с Google Таблицей")
+
+
+def google_sync_retry_worker():
+    """Повторяет доставку всех несинхронизированных заявок каждые 60 секунд."""
+    sync_all_requests_to_google()
+    while True:
+        time.sleep(GOOGLE_SYNC_RETRY_INTERVAL)
+        try:
+            with sqlite3.connect(DB_FILE) as connection:
+                pending_count = connection.execute(
+                    "SELECT COUNT(*) FROM customer_requests WHERE google_synced = 0"
+                ).fetchone()[0]
+            if pending_count:
+                logging.info(
+                    "Повторная фоновая синхронизация: ожидают отправки %s заявок",
+                    pending_count
+                )
+                sync_all_requests_to_google()
+        except Exception:
+            logging.exception("Ошибка фоновой повторной синхронизации Google Таблиц")
 
 
 def save_customer_request(
@@ -798,7 +934,8 @@ def set_admin_order_status(user_id, order_id, status):
     with sqlite3.connect(DB_FILE) as connection:
         cursor = connection.execute(
             "UPDATE customer_requests "
-            "SET status = ?, archived = ?, archive_reason = ? WHERE id = ?",
+            "SET status = ?, archived = ?, archive_reason = ?, google_synced = 0 "
+            "WHERE id = ?",
             (status, is_archived, archive_reason, int(order_id))
         )
         found = cursor.rowcount > 0
@@ -2092,7 +2229,9 @@ def handle_button(user_id, payload):
         with sqlite3.connect(DB_FILE) as connection:
             cursor = connection.execute(
                 "UPDATE customer_requests "
-                "SET archived = 1, archive_reason = 'Перемещена администратором в архив' "
+                "SET archived = 1, "
+                "archive_reason = 'Перемещена администратором в архив', "
+                "google_synced = 0 "
                 "WHERE id = ? AND archived = 0",
                 (order_id,)
             )
@@ -2625,7 +2764,7 @@ if __name__ == "__main__":
     ).start()
 
     threading.Thread(
-        target=sync_all_requests_to_google,
+        target=google_sync_retry_worker,
         daemon=True
     ).start()
 
