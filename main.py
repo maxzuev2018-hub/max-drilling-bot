@@ -366,6 +366,7 @@ def show_admin_order(user_id, order_id):
         [{"type": "callback", "text": "🆕 Новая", "payload": f"admin_status:{order_id}:Новая"}],
         [{"type": "callback", "text": "🔧 В работе", "payload": f"admin_status:{order_id}:В работе"}],
         [{"type": "callback", "text": "✅ Завершена", "payload": f"admin_status:{order_id}:Завершена"}],
+        [{"type": "callback", "text": "🗑 Удалить заявку", "payload": f"admin_delete_confirm:{order_id}"}],
         [{"type": "callback", "text": "⬅️ К списку заявок", "payload": "admin_orders"}],
     ]
     send_message(user_id,
@@ -1210,12 +1211,80 @@ def handle_button(user_id, payload):
         show_admin_order(user_id, order_id)
         return
 
+    if payload.startswith("admin_delete_confirm:"):
+        if not is_admin(user_id):
+            send_message(user_id, "⛔ Доступ запрещён.")
+            return
+
+        try:
+            order_id = int(payload.split(":", 1)[1])
+        except ValueError:
+            send_message(user_id, "Некорректный номер заявки.")
+            return
+
+        with sqlite3.connect(DB_FILE) as connection:
+            row = connection.execute(
+                "SELECT id, customer_name FROM customer_requests WHERE id = ?",
+                (order_id,)
+            ).fetchone()
+
+        if not row:
+            send_message(user_id, "Заявка не найдена.")
+            return
+
+        buttons = [
+            [{
+                "type": "callback",
+                "text": "🗑 Да, удалить",
+                "payload": f"admin_delete:{order_id}"
+            }],
+            [{
+                "type": "callback",
+                "text": "❌ Отмена",
+                "payload": f"admin_order:{order_id}"
+            }]
+        ]
+
+        send_message(
+            user_id,
+            f"⚠️ ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ\n\n"
+            f"Вы действительно хотите удалить заявку №{order_id} "
+            f"({row[1]})?\n\nЭто действие нельзя отменить.",
+            buttons
+        )
+        return
+
     if payload.startswith("admin_status:"):
         try:
             _, order_id, status = payload.split(":", 2)
             set_admin_order_status(user_id, int(order_id), status)
         except ValueError:
             send_message(user_id, "Некорректные данные статуса.")
+        return
+
+    if payload.startswith("admin_delete:"):
+        if not is_admin(user_id):
+            send_message(user_id, "⛔ Доступ запрещён.")
+            return
+
+        try:
+            order_id = int(payload.split(":", 1)[1])
+        except ValueError:
+            send_message(user_id, "Некорректный номер заявки.")
+            return
+
+        with sqlite3.connect(DB_FILE) as connection:
+            cursor = connection.execute(
+                "DELETE FROM customer_requests WHERE id = ?",
+                (order_id,)
+            )
+
+        if cursor.rowcount:
+            send_message(user_id, f"🗑 Заявка №{order_id} удалена.")
+            show_admin_panel(user_id)
+        else:
+            send_message(user_id, "Заявка не найдена.")
+
         return
 
     if payload == "cancel":
