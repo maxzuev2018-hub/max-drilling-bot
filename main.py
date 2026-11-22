@@ -112,21 +112,17 @@ def connect_google_sheets():
             return None
 
         credentials_data = json.loads(credentials_json)
-
         credentials = Credentials.from_service_account_info(
             credentials_data,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets"
-            ]
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
         )
 
         client = gspread.authorize(credentials)
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
-
         logging.info("Google Таблица успешно подключена")
         return spreadsheet
 
-        except Exception:
+    except Exception:
         logging.exception("Ошибка подключения Google Таблиц")
         return None
 
@@ -157,9 +153,32 @@ def init_history_db():
                 status TEXT NOT NULL DEFAULT 'Новая'
             )
         """)
+        # Безопасная миграция существующей базы: данные заявок не удаляются.
+        columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(customer_requests)"
+            ).fetchall()
+        }
+        if "archived" not in columns:
+            connection.execute(
+                "ALTER TABLE customer_requests "
+                "ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
+            )
+        if "archive_reason" not in columns:
+            connection.execute(
+                "ALTER TABLE customer_requests ADD COLUMN archive_reason TEXT"
+            )
+
+        # Уже завершённые заявки переводим в архив при первом запуске новой версии.
         connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_customer_requests_status "
-            "ON customer_requests(status, id DESC)"
+            "UPDATE customer_requests "
+            "SET archived = 1, archive_reason = COALESCE(archive_reason, 'Завершена') "
+            "WHERE status = 'Завершена' AND archived = 0"
+        )
+
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_customer_requests_archive_status "
+            "ON customer_requests(archived, status, id DESC)"
         )
 
 
@@ -226,6 +245,81 @@ def is_admin(user_id):
     return bool(ADMIN_USER_ID) and str(user_id) == str(ADMIN_USER_ID)
 
 
+def _google_sheet_row_index(worksheet, order_id):
+    """Возвращает номер строки заявки по ID в первом столбце."""
+    for row_number, value in enumerate(worksheet.col_values(1), start=1):
+        if row_number > 1 and str(value).strip() == str(order_id):
+            return row_number
+    return None
+
+
+def _upsert_google_sheet_row(worksheet, values):
+    """Обновляет существующую строку или добавляет её без дублирования ID."""
+    row_number = _google_sheet_row_index(worksheet, values[0])
+    if row_number:
+        worksheet.update(
+            values=[values],
+            range_name=f"A{row_number}:I{row_number}",
+            value_input_option="USER_ENTERED"
+        )
+    else:
+        worksheet.append_row(values, value_input_option="USER_ENTERED")
+
+
+def _delete_google_sheet_rows(worksheet, order_id):
+    """Удаляет все строки с данным ID из листа (заголовок не затрагивает)."""
+    matching_rows = [
+        row_number
+        for row_number, value in enumerate(worksheet.col_values(1), start=1)
+        if row_number > 1 and str(value).strip() == str(order_id)
+    ]
+    for row_number in reversed(matching_rows):
+        worksheet.delete_rows(row_number)
+
+
+def sync_request_to_google(order_id):
+    """Синхронизирует одну заявку из SQLite в нужный лист Google Таблицы."""
+    with sqlite3.connect(DB_FILE) as connection:
+        row = connection.execute(
+            "SELECT id, created_at, customer_name, phone, result, status, "
+            "archived FROM customer_requests WHERE id = ?",
+            (int(order_id),)
+        ).fetchone()
+
+    if not row:
+        return False
+
+    request_id, created_at, customer_name, phone, result, status, archived = row
+    spreadsheet = connect_google_sheets()
+    if not spreadsheet:
+        return False
+
+    active_sheet = spreadsheet.worksheet("Активные заявки")
+    archive_sheet = spreadsheet.worksheet("Архив")
+    section = "Архив" if archived else "Активная"
+    values = [
+        request_id,
+        created_at,
+        customer_name,
+        phone,
+        "",       # Адрес пока не собирается формой заявки.
+        result,
+        "",       # Сумма пока не хранится отдельным полем заявки.
+        status,
+        section
+    ]
+
+    if archived:
+        # Сначала гарантируем запись в архиве, затем убираем её из активного листа.
+        _upsert_google_sheet_row(archive_sheet, values)
+        _delete_google_sheet_rows(active_sheet, request_id)
+    else:
+        _upsert_google_sheet_row(active_sheet, values)
+        _delete_google_sheet_rows(archive_sheet, request_id)
+
+    return True
+
+
 def save_customer_request(user_id, customer_name, phone, result):
     created_at = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
 
@@ -239,26 +333,14 @@ def save_customer_request(user_id, customer_name, phone, result):
         order_id = cursor.lastrowid
 
     try:
-        spreadsheet = connect_google_sheets()
-        if spreadsheet:
-            worksheet = spreadsheet.worksheet("Активные заявки")
-            worksheet.append_row([
-                order_id,
-                created_at,
-                customer_name,
-                phone,
-                "",
-                result,
-                "",
-                "Новая",
-                "Активная"
-            ], value_input_option="USER_ENTERED")
-
-            logging.info("Заявка №%s добавлена в Google Таблицу", order_id)
-
+        synced = sync_request_to_google(order_id)
+        if synced:
+            logging.info("Заявка №%s синхронизирована с Google Таблицей", order_id)
+        else:
+            logging.warning("Заявка №%s сохранена в SQLite, но Google Таблица пока не обновлена", order_id)
     except Exception:
         logging.exception(
-            "Не удалось отправить заявку №%s в Google Таблицу",
+            "Не удалось синхронизировать заявку №%s с Google Таблицей",
             order_id
         )
 
@@ -269,32 +351,41 @@ def show_admin_panel(user_id):
     if not is_admin(user_id):
         send_message(user_id, "⛔ Доступ запрещён.")
         return
+
     with sqlite3.connect(DB_FILE) as connection:
-        total = connection.execute("SELECT COUNT(*) FROM customer_requests").fetchone()[0]
+        total = connection.execute(
+            "SELECT COUNT(*) FROM customer_requests"
+        ).fetchone()[0]
+        active_count = connection.execute(
+            "SELECT COUNT(*) FROM customer_requests WHERE archived = 0"
+        ).fetchone()[0]
         new_count = connection.execute(
-            "SELECT COUNT(*) FROM customer_requests WHERE status = 'Новая'"
+            "SELECT COUNT(*) FROM customer_requests "
+            "WHERE archived = 0 AND status = 'Новая'"
         ).fetchone()[0]
         work_count = connection.execute(
-            "SELECT COUNT(*) FROM customer_requests WHERE status = 'В работе'"
+            "SELECT COUNT(*) FROM customer_requests "
+            "WHERE archived = 0 AND status = 'В работе'"
         ).fetchone()[0]
-        done_count = connection.execute(
-            "SELECT COUNT(*) FROM customer_requests WHERE status = 'Завершена'"
+        archive_count = connection.execute(
+            "SELECT COUNT(*) FROM customer_requests WHERE archived = 1"
         ).fetchone()[0]
+
     buttons = [
-        [{"type": "callback", "text": "📥 Все заявки", "payload": "admin_orders"}],
+        [{"type": "callback", "text": "📥 Все активные заявки", "payload": "admin_orders"}],
         [{"type": "callback", "text": "🆕 Новые заявки", "payload": "admin_orders_new"}],
         [{"type": "callback", "text": "🔧 Заявки в работе", "payload": "admin_orders_work"}],
-        [{"type": "callback", "text": "✅ Завершённые", "payload": "admin_orders_done"}],
+        [{"type": "callback", "text": "🗃 Архив заявок", "payload": "admin_archive"}],
         [{"type": "callback", "text": "🔎 Поиск по имени или телефону", "payload": "admin_search"}],
         [{"type": "callback", "text": "🏠 Главное меню", "payload": "menu"}],
     ]
     send_message(
         user_id,
-        f"🛠 АДМИН-ПАНЕЛЬ\n\nВсего заявок: {total}\nНовых: {new_count}\n"
-        f"В работе: {work_count}\nЗавершённых: {done_count}",
+        f"🛠 АДМИН-ПАНЕЛЬ\n\nВсего заявок: {total}\n"
+        f"Активных: {active_count}\nНовых: {new_count}\n"
+        f"В работе: {work_count}\nВ архиве: {archive_count}",
         buttons
     )
-
 
 
 def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
@@ -305,54 +396,41 @@ def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
     if only_new:
         status = "Новая"
 
-    conditions = []
+    conditions = ["archived = 0"]
     params = []
-
     if status:
         conditions.append("status = ?")
         params.append(status)
 
     query = (
         "SELECT id, created_at, customer_name, phone, status "
-        "FROM customer_requests"
+        "FROM customer_requests WHERE " + " AND ".join(conditions) +
+        " ORDER BY id DESC"
     )
-
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-
-    query += " ORDER BY id DESC"
-
     with sqlite3.connect(DB_FILE) as connection:
         rows = connection.execute(query, params).fetchall()
 
     if search_term:
         term = search_term.strip().casefold()
-
         rows = [
             row for row in rows
             if term in str(row[2] or "").casefold()
             or term in str(row[3] or "").casefold()
             or term in str(row[0])
         ]
-
-        rows = rows[:20]
-
         title = f"🔎 РЕЗУЛЬТАТЫ ПОИСКА: {search_term}"
+    elif status == "Новая":
+        title = "🆕 НОВЫЕ ЗАЯВКИ"
+    elif status == "В работе":
+        title = "🔧 ЗАЯВКИ В РАБОТЕ"
     else:
-        rows = rows[:20]
+        title = "📋 АКТИВНЫЕ ЗАЯВКИ"
 
-        if status == "Новая":
-            title = "🆕 НОВЫЕ ЗАЯВКИ"
-        elif status == "В работе":
-            title = "🔧 ЗАЯВКИ В РАБОТЕ"
-        elif status == "Завершена":
-            title = "✅ ЗАВЕРШЁННЫЕ ЗАЯВКИ"
-        else:
-            title = "📋 ВСЕ ЗАЯВКИ"
-
+    rows = rows[:20]
     if not rows:
         buttons = [
             [{"type": "callback", "text": "🔎 Новый поиск", "payload": "admin_search"}],
+            [{"type": "callback", "text": "🗃 Архив", "payload": "admin_archive"}],
             [{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}],
         ]
         send_message(user_id, f"{title}\n\nНичего не найдено.", buttons)
@@ -360,7 +438,6 @@ def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
 
     lines = [title, "", "Показаны последние 20 подходящих заявок:"]
     buttons = []
-
     for order_id, created_at, name, phone, order_status in rows:
         lines.append(
             f"№{order_id} — {name} — {phone} — {order_status} — {created_at}"
@@ -373,11 +450,53 @@ def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
 
     buttons.extend([
         [{"type": "callback", "text": "🔎 Поиск", "payload": "admin_search"}],
+        [{"type": "callback", "text": "🗃 Архив", "payload": "admin_archive"}],
         [{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}],
     ])
-
     send_message(user_id, "\n".join(lines), buttons)
 
+
+def show_admin_archive(user_id, only_completed=False):
+    if not is_admin(user_id):
+        send_message(user_id, "⛔ Доступ запрещён.")
+        return
+
+    query = (
+        "SELECT id, created_at, customer_name, phone, status, archive_reason "
+        "FROM customer_requests WHERE archived = 1"
+    )
+    params = []
+    if only_completed:
+        query += " AND status = ?"
+        params.append("Завершена")
+    query += " ORDER BY id DESC LIMIT 20"
+
+    with sqlite3.connect(DB_FILE) as connection:
+        rows = connection.execute(query, params).fetchall()
+
+    title = "✅ ЗАВЕРШЁННЫЕ ЗАЯВКИ" if only_completed else "🗃 АРХИВ ЗАЯВОК"
+    if not rows:
+        send_message(
+            user_id,
+            f"{title}\n\nВ архиве пока нет заявок.",
+            [[{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}]]
+        )
+        return
+
+    lines = [title, "", "Последние 20 заявок:"]
+    buttons = []
+    for order_id, created_at, name, phone, order_status, reason in rows:
+        suffix = f" ({reason})" if reason else ""
+        lines.append(
+            f"№{order_id} — {name} — {phone} — {order_status} — {created_at}{suffix}"
+        )
+        buttons.append([{
+            "type": "callback",
+            "text": f"Открыть заявку №{order_id}",
+            "payload": f"admin_archive_order:{order_id}"
+        }])
+    buttons.append([{"type": "callback", "text": "⬅️ В админ-панель", "payload": "admin_panel"}])
+    send_message(user_id, "\n".join(lines), buttons)
 
 
 def start_admin_search(user_id):
@@ -408,30 +527,45 @@ def process_admin_search(user_id, search_term):
     show_admin_orders(user_id, search_term=term)
 
 
-def show_admin_order(user_id, order_id):
+def show_admin_order(user_id, order_id, from_archive=False):
     if not is_admin(user_id):
         send_message(user_id, "⛔ Доступ запрещён.")
         return
     with sqlite3.connect(DB_FILE) as connection:
         row = connection.execute(
-            "SELECT user_id, created_at, customer_name, phone, result, status "
-            "FROM customer_requests WHERE id = ?", (int(order_id),)
+            "SELECT user_id, created_at, customer_name, phone, result, status, "
+            "archived, archive_reason FROM customer_requests WHERE id = ?",
+            (int(order_id),)
         ).fetchone()
     if not row:
         send_message(user_id, "Заявка не найдена.")
         return
-    client_id, created_at, name, phone, result, status = row
+
+    client_id, created_at, name, phone, result, status, archived, reason = row
+    section = "Архив" if archived else "Активные заявки"
     buttons = [
         [{"type": "callback", "text": "🆕 Новая", "payload": f"admin_status:{order_id}:Новая"}],
         [{"type": "callback", "text": "🔧 В работе", "payload": f"admin_status:{order_id}:В работе"}],
         [{"type": "callback", "text": "✅ Завершена", "payload": f"admin_status:{order_id}:Завершена"}],
-        [{"type": "callback", "text": "🗑 Удалить заявку", "payload": f"admin_delete_confirm:{order_id}"}],
-        [{"type": "callback", "text": "⬅️ К списку заявок", "payload": "admin_orders"}],
     ]
-    send_message(user_id,
-        f"📋 ЗАЯВКА №{order_id}\nДата: {created_at}\nСтатус: {status}\n\n"
+    if not archived:
+        buttons.append([{
+            "type": "callback",
+            "text": "🗃 Переместить в архив",
+            "payload": f"admin_delete_confirm:{order_id}"
+        }])
+    back_payload = "admin_archive" if from_archive or archived else "admin_orders"
+    back_text = "⬅️ К архиву" if from_archive or archived else "⬅️ К активным заявкам"
+    buttons.append([{"type": "callback", "text": back_text, "payload": back_payload}])
+
+    reason_line = f"\nПричина архивации: {reason}" if reason else ""
+    send_message(
+        user_id,
+        f"📋 ЗАЯВКА №{order_id}\nДата: {created_at}\nСтатус: {status}"
+        f"\nРаздел: {section}{reason_line}\n\n"
         f"Имя: {name}\nТелефон: {phone}\nID клиента MAX: {client_id}\n\n{result}",
-        buttons)
+        buttons
+    )
 
 
 def set_admin_order_status(user_id, order_id, status):
@@ -441,16 +575,32 @@ def set_admin_order_status(user_id, order_id, status):
     if status not in ("Новая", "В работе", "Завершена"):
         send_message(user_id, "Недопустимый статус.")
         return
+
+    is_archived = 1 if status == "Завершена" else 0
+    archive_reason = "Завершена" if is_archived else None
     with sqlite3.connect(DB_FILE) as connection:
         cursor = connection.execute(
-            "UPDATE customer_requests SET status = ? WHERE id = ?",
-            (status, int(order_id))
+            "UPDATE customer_requests "
+            "SET status = ?, archived = ?, archive_reason = ? WHERE id = ?",
+            (status, is_archived, archive_reason, int(order_id))
         )
-    if cursor.rowcount:
-        send_message(user_id, f"✅ Статус заявки №{order_id} изменён: {status}")
-        show_admin_order(user_id, order_id)
-    else:
+        found = cursor.rowcount > 0
+
+    if not found:
         send_message(user_id, "Заявка не найдена.")
+        return
+
+    try:
+        sync_request_to_google(order_id)
+    except Exception:
+        logging.exception("Не удалось синхронизировать заявку №%s с Google Таблицей", order_id)
+
+    if is_archived:
+        send_message(user_id, f"✅ Заявка №{order_id} завершена и перемещена в архив.")
+        show_admin_order(user_id, order_id, from_archive=True)
+    else:
+        send_message(user_id, f"✅ Статус заявки №{order_id} изменён: {status}. Заявка возвращена в активные.")
+        show_admin_order(user_id, order_id)
 
 
 # =========================================================
@@ -1249,7 +1399,20 @@ def handle_button(user_id, payload):
         return
 
     if payload == "admin_orders_done":
-        show_admin_orders(user_id, status="Завершена")
+        show_admin_archive(user_id, only_completed=True)
+        return
+
+    if payload == "admin_archive":
+        show_admin_archive(user_id)
+        return
+
+    if payload.startswith("admin_archive_order:"):
+        try:
+            order_id = int(payload.split(":", 1)[1])
+        except ValueError:
+            send_message(user_id, "Некорректный номер заявки.")
+            return
+        show_admin_order(user_id, order_id, from_archive=True)
         return
 
     if payload == "admin_search":
@@ -1294,7 +1457,7 @@ def handle_button(user_id, payload):
         buttons = [
             [{
                 "type": "callback",
-                "text": "🗑 Да, удалить",
+                "text": "🗃 Да, в архив",
                 "payload": f"admin_delete:{order_id}"
             }],
             [{
@@ -1306,9 +1469,9 @@ def handle_button(user_id, payload):
 
         send_message(
             user_id,
-            f"⚠️ ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ\n\n"
-            f"Вы действительно хотите удалить заявку №{order_id} "
-            f"({row[1]})?\n\nЭто действие нельзя отменить.",
+            f"🗃 ПЕРЕМЕЩЕНИЕ В АРХИВ\n\n"
+            f"Переместить заявку №{order_id} ({row[1]}) из активных в архив?\n\n"
+            "Все данные заявки сохранятся в базе бота и будут доступны в архиве.",
             buttons
         )
         return
@@ -1334,15 +1497,25 @@ def handle_button(user_id, payload):
 
         with sqlite3.connect(DB_FILE) as connection:
             cursor = connection.execute(
-                "DELETE FROM customer_requests WHERE id = ?",
+                "UPDATE customer_requests "
+                "SET archived = 1, archive_reason = 'Перемещена администратором в архив' "
+                "WHERE id = ? AND archived = 0",
                 (order_id,)
             )
+            found = cursor.rowcount > 0
 
-        if cursor.rowcount:
-            send_message(user_id, f"🗑 Заявка №{order_id} удалена.")
+        if found:
+            try:
+                sync_request_to_google(order_id)
+            except Exception:
+                logging.exception(
+                    "Не удалось синхронизировать архивирование заявки №%s",
+                    order_id
+                )
+            send_message(user_id, f"🗃 Заявка №{order_id} перемещена в архив. Данные сохранены.")
             show_admin_panel(user_id)
         else:
-            send_message(user_id, "Заявка не найдена.")
+            send_message(user_id, "Активная заявка не найдена.")
 
         return
 
