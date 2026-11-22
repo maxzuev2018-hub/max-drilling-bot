@@ -3,3 +3,4 @@ requests
 gunicorn
 certifi>=2025.1.31
 gspread
+google-auth
