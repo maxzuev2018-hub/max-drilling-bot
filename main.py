@@ -733,9 +733,13 @@ def show_admin_order(user_id, order_id, from_archive=False):
             "text": "🗃 Переместить в архив",
             "payload": f"admin_delete_confirm:{order_id}"
         }])
-    back_payload = "admin_archive" if from_archive or archived else "admin_orders"
-    back_text = "⬅️ К архиву" if from_archive or archived else "⬅️ К активным заявкам"
-    buttons.append([{"type": "callback", "text": back_text, "payload": back_payload}])
+    if from_archive or archived:
+        buttons.append([{"type": "callback", "text": "🗃 К архиву", "payload": "admin_archive"}])
+        buttons.append([{"type": "callback", "text": "📥 К активным заявкам", "payload": "admin_orders"}])
+        buttons.append([{"type": "callback", "text": "🛠 В админ-панель", "payload": "admin_panel"}])
+    else:
+        buttons.append([{"type": "callback", "text": "📥 К активным заявкам", "payload": "admin_orders"}])
+        buttons.append([{"type": "callback", "text": "🛠 В админ-панель", "payload": "admin_panel"}])
 
     reason_line = f"\nПричина архивации: {reason}" if reason else ""
     optional_lines = []
