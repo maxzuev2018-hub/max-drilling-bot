@@ -17,6 +17,9 @@ from copy import deepcopy
 import requests
 from flask import Flask, request, jsonify
 from requests.adapters import HTTPAdapter
+import json
+import gspread
+from google.oauth2.service_account import Credentials
 
 
 # =========================================================
@@ -96,6 +99,7 @@ admin_search_states = set()
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_FILE = DATA_DIR / "orders_history.sqlite3"
+GOOGLE_SHEET_ID = "1H9wwHnRb4-EWDrJPtd66U48miw9HfIuDZzP4krzyo3o"
 logging.info("База заказов и заявок: %s", DB_FILE)
 
 
