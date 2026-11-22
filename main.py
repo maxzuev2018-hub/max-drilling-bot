@@ -179,6 +179,13 @@ def init_history_db():
                 "ALTER TABLE customer_requests "
                 "ADD COLUMN group_notified INTEGER NOT NULL DEFAULT 1"
             )
+        if "photos" not in columns:
+            # Храним переиспользуемые media-токены MAX, чтобы фото можно было
+            # повторно отправить администратору и в рабочую группу.
+            connection.execute(
+                "ALTER TABLE customer_requests "
+                "ADD COLUMN photos TEXT NOT NULL DEFAULT '[]'"
+            )
 
         connection.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
@@ -277,7 +284,7 @@ def _upsert_google_sheet_row(worksheet, values):
     if row_number:
         worksheet.update(
             values=[values],
-            range_name=f"A{row_number}:K{row_number}",
+            range_name=f"A{row_number}:L{row_number}",
             value_input_option="USER_ENTERED"
         )
     else:
@@ -316,12 +323,13 @@ def ensure_google_sheet_layout(worksheet):
 
         expected_headers = [
             "Удобное время для связи",
-            "Комментарий клиента"
+            "Комментарий клиента",
+            "Фотографии объекта"
         ]
-        if headers[9:11] != expected_headers:
+        if headers[9:12] != expected_headers:
             worksheet.update(
                 values=[expected_headers],
-                range_name="J1:K1",
+                range_name="J1:L1",
                 value_input_option="RAW"
             )
 
@@ -335,6 +343,24 @@ def _delete_google_sheet_rows(worksheet, order_id):
     ]
     for row_number in reversed(matching_rows):
         worksheet.delete_rows(row_number)
+
+
+def parse_photo_tokens(photos_json):
+    """Возвращает безопасный список MAX media-токенов из поля SQLite."""
+    try:
+        values = json.loads(photos_json or "[]")
+    except (TypeError, json.JSONDecodeError):
+        logging.warning("Некорректный JSON со списком фотографий заявки")
+        return []
+
+    if not isinstance(values, list):
+        return []
+
+    tokens = []
+    for value in values:
+        if isinstance(value, str) and value.strip() and value not in tokens:
+            tokens.append(value.strip())
+    return tokens[:10]
 
 
 def extract_total_from_result(result):
@@ -376,7 +402,7 @@ def sync_request_to_google(order_id):
     with sqlite3.connect(DB_FILE) as connection:
         row = connection.execute(
             "SELECT id, created_at, customer_name, phone, result, status, archived, "
-            "address, locality, contact_time, comment "
+            "address, locality, contact_time, comment, photos "
             "FROM customer_requests WHERE id = ?",
             (int(order_id),)
         ).fetchone()
@@ -385,7 +411,8 @@ def sync_request_to_google(order_id):
         return False
 
     request_id, created_at, customer_name, phone, result, status, archived, \
-        address, locality, contact_time, comment = row
+        address, locality, contact_time, comment, photos_json = row
+    photo_tokens = parse_photo_tokens(photos_json)
     spreadsheet = connect_google_sheets()
     if not spreadsheet:
         return False
@@ -410,7 +437,8 @@ def sync_request_to_google(order_id):
         status,
         section,
         contact_time or "",
-        comment or ""
+        comment or "",
+        f"{len(photo_tokens)} фото" if photo_tokens else ""
     ]
 
     if archived:
@@ -460,7 +488,7 @@ def sync_all_requests_to_google():
 
 def save_customer_request(
     user_id, customer_name, phone, result,
-    address="", contact_time="", comment=""
+    address="", contact_time="", comment="", photos=None
 ):
     created_at = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
 
@@ -468,11 +496,12 @@ def save_customer_request(
         cursor = connection.execute(
             "INSERT INTO customer_requests "
             "(user_id, created_at, customer_name, phone, result, status, "
-            "address, contact_time, comment, group_notified) "
-            "VALUES (?, ?, ?, ?, ?, 'Новая', ?, ?, ?, 0)",
+            "address, contact_time, comment, group_notified, photos) "
+            "VALUES (?, ?, ?, ?, ?, 'Новая', ?, ?, ?, 0, ?)",
             (
                 str(user_id), created_at, customer_name, phone, result,
-                address, contact_time, comment
+                address, contact_time, comment,
+                json.dumps(parse_photo_tokens(json.dumps(photos or [])), ensure_ascii=False)
             )
         )
         order_id = cursor.lastrowid
@@ -679,7 +708,7 @@ def show_admin_order(user_id, order_id, from_archive=False):
     with sqlite3.connect(DB_FILE) as connection:
         row = connection.execute(
             "SELECT user_id, created_at, customer_name, phone, result, status, "
-            "archived, archive_reason, address, locality, contact_time, comment "
+            "archived, archive_reason, address, locality, contact_time, comment, photos "
             "FROM customer_requests WHERE id = ?",
             (int(order_id),)
         ).fetchone()
@@ -689,8 +718,9 @@ def show_admin_order(user_id, order_id, from_archive=False):
 
     (
         client_id, created_at, name, phone, result, status, archived, reason,
-        address, locality, contact_time, comment
+        address, locality, contact_time, comment, photos_json
     ) = row
+    photo_tokens = parse_photo_tokens(photos_json)
     section = "Архив" if archived else "Активные заявки"
     buttons = [
         [{"type": "callback", "text": "🆕 Новая", "payload": f"admin_status:{order_id}:Новая"}],
@@ -716,6 +746,8 @@ def show_admin_order(user_id, order_id, from_archive=False):
         optional_lines.append(f"Удобное время для связи: {contact_time}")
     if comment:
         optional_lines.append(f"Комментарий клиента: {comment}")
+    if photo_tokens:
+        optional_lines.append(f"Фотографии объекта: {len(photo_tokens)} шт. (отправлены в уведомлении)")
     optional_details = "\n".join(optional_lines)
     optional_block = f"\n\nДополнительная информация:\n{optional_details}" if optional_details else ""
 
@@ -814,14 +846,21 @@ EXTRAS = {
 # ОБЩИЕ ФУНКЦИИ
 # =========================================================
 
-def send_message(user_id, text, buttons=None):
+def send_message(user_id, text, buttons=None, photo_tokens=None):
     body = {"text": text}
+    attachments = [
+        {"type": "image", "payload": {"token": token}}
+        for token in parse_photo_tokens(json.dumps(photo_tokens or []))
+    ]
 
     if buttons:
-        body["attachments"] = [{
+        attachments.append({
             "type": "inline_keyboard",
             "payload": {"buttons": buttons}
-        }]
+        })
+
+    if attachments:
+        body["attachments"] = attachments
 
     response = session.post(
         f"{API_URL}/messages",
@@ -839,7 +878,7 @@ def send_message(user_id, text, buttons=None):
     response.raise_for_status()
 
 
-def notify_admin(text):
+def notify_admin(text, photo_tokens=None):
     if not ADMIN_USER_ID:
         raise RuntimeError("Не задан ADMIN_USER_ID")
 
@@ -851,7 +890,7 @@ def notify_admin(text):
         }
     ]]
 
-    send_message(ADMIN_USER_ID, text, buttons)
+    send_message(ADMIN_USER_ID, text, buttons, photo_tokens=photo_tokens)
 
 
 WORK_GROUP_BIND_COMMAND = "!привязать_рабочую_группу"
@@ -884,13 +923,21 @@ def clear_work_group_chat_id(chat_id):
         )
 
 
-def send_group_message(chat_id, text):
+def send_group_message(chat_id, text, photo_tokens=None):
     # В MAX для группового чата используется query-параметр chat_id, не user_id.
+    attachments = [
+        {"type": "image", "payload": {"token": token}}
+        for token in parse_photo_tokens(json.dumps(photo_tokens or []))
+    ]
+    body = {"text": text[:3900]}
+    if attachments:
+        body["attachments"] = attachments
+
     response = session.post(
         f"{API_URL}/messages",
         headers=HEADERS,
         params={"chat_id": int(chat_id)},
-        json={"text": text[:3900]},
+        json=body,
         timeout=20
     )
     logging.info(
@@ -902,7 +949,8 @@ def send_group_message(chat_id, text):
 
 
 def format_group_request(row):
-    order_id, created_at, name, phone, result, address, locality, contact_time, comment = row
+    order_id, created_at, name, phone, result, address, locality, contact_time, comment, photos_json = row
+    photo_tokens = parse_photo_tokens(photos_json)
     details = [
         f"📥 НОВАЯ ЗАЯВКА №{order_id}",
         f"📅 Дата: {created_at}",
@@ -916,6 +964,8 @@ def format_group_request(row):
         details.append(f"🕒 Удобное время для связи: {contact_time}")
     if comment:
         details.append(f"💬 Комментарий клиента: {comment}")
+    if photo_tokens:
+        details.append(f"📷 Фотографии объекта: {len(photo_tokens)} шт.")
     details.extend([
         "",
         str(result or "Заявка без предварительного расчёта."),
@@ -939,14 +989,18 @@ def sync_pending_group_notifications():
         with sqlite3.connect(DB_FILE) as connection:
             rows = connection.execute(
                 "SELECT id, created_at, customer_name, phone, result, address, "
-                "locality, contact_time, comment "
+                "locality, contact_time, comment, photos "
                 "FROM customer_requests WHERE group_notified = 0 ORDER BY id"
             ).fetchall()
 
         for row in rows:
             order_id = row[0]
             try:
-                send_group_message(chat_id, format_group_request(row))
+                send_group_message(
+                    chat_id,
+                    format_group_request(row),
+                    photo_tokens=parse_photo_tokens(row[9])
+                )
             except Exception:
                 logging.exception(
                     "Не удалось отправить заявку №%s в рабочую группу; она останется в очереди",
@@ -999,7 +1053,7 @@ def main_menu(user_id):
         }],
         [{
             "type": "callback",
-            "text": "📩 Оставить заявку",
+            "text": "📩 Заказать без расчёта",
             "payload": "request_start"
         }],
         [{
@@ -1489,7 +1543,8 @@ def start_lead(user_id, result):
         "result": result,
         "address": "",
         "contact_time": "",
-        "comment": ""
+        "comment": "",
+        "photos": []
     }
 
     send_message(
@@ -1560,6 +1615,101 @@ def ask_optional_lead_field(user_id, step):
     )
 
 
+MAX_REQUEST_PHOTOS = 10
+
+
+def ask_lead_photos(user_id):
+    """Предлагает клиенту приложить фотографии объекта; шаг необязательный."""
+    uid = str(user_id)
+    state = lead_states.get(uid)
+    if not state:
+        return
+
+    state["step"] = "photos"
+    count = len(state.get("photos", []))
+    send_message(
+        user_id,
+        "📷 Фотографии объекта\n\n"
+        "Можете отправить до 10 фотографий места будущего бурения. "
+        "Отправляйте их по одной или несколькими за раз.\n\n"
+        f"Уже получено: {count} из {MAX_REQUEST_PHOTOS}.\n"
+        "Когда закончите, нажмите «Готово». Этот шаг можно пропустить.",
+        [[{
+            "type": "callback",
+            "text": "✅ Готово",
+            "payload": "lead_photos_done"
+        }], [{
+            "type": "callback",
+            "text": "Пропустить фотографии",
+            "payload": "lead_skip_photos"
+        }]]
+    )
+
+
+def process_lead_photo_message(user_id, attachments):
+    """Сохраняет токены фотографий MAX в состоянии оформления заявки."""
+    uid = str(user_id)
+    state = lead_states.get(uid)
+    if not state or state.get("step") != "photos":
+        return
+
+    current = state.setdefault("photos", [])
+    received = []
+    invalid_images = 0
+
+    for attachment in attachments or []:
+        if not isinstance(attachment, dict) or attachment.get("type") != "image":
+            continue
+        payload = attachment.get("payload") or {}
+        token = payload.get("token")
+        if not token:
+            invalid_images += 1
+            continue
+        token = str(token).strip()
+        if token and token not in current and token not in received:
+            received.append(token)
+
+    available = max(0, MAX_REQUEST_PHOTOS - len(current))
+    accepted = received[:available]
+    current.extend(accepted)
+
+    if invalid_images:
+        logging.warning(
+            "Получены изображения без повторно используемого token от user_id=%s",
+            user_id
+        )
+
+    if not accepted:
+        send_message(
+            user_id,
+            "Не удалось принять фотографии. Отправьте изображения ещё раз "
+            "или нажмите «Готово» для продолжения."
+        )
+        return
+
+    count = len(current)
+    send_message(
+        user_id,
+        f"✅ Получено фотографий: {count} из {MAX_REQUEST_PHOTOS}.\n"
+        "Можете отправить ещё или нажать «Готово».",
+        [[{
+            "type": "callback",
+            "text": "✅ Готово",
+            "payload": "lead_photos_done"
+        }], [{
+            "type": "callback",
+            "text": "Пропустить фотографии",
+            "payload": "lead_skip_photos"
+        }]]
+    )
+
+    if len(received) > available:
+        send_message(
+            user_id,
+            f"Можно прикрепить не более {MAX_REQUEST_PHOTOS} фотографий к одной заявке."
+        )
+
+
 def advance_optional_lead_field(user_id, current_step):
     next_steps = {
         "address": "contact_time",
@@ -1569,7 +1719,7 @@ def advance_optional_lead_field(user_id, current_step):
     if next_step:
         ask_optional_lead_field(user_id, next_step)
     else:
-        finalize_lead(user_id)
+        ask_lead_photos(user_id)
 
 
 def skip_optional_lead_field(user_id, field):
@@ -1599,7 +1749,8 @@ def finalize_lead(user_id):
             state["result"],
             address=state.get("address", ""),
             contact_time=state.get("contact_time", ""),
-            comment=state.get("comment", "")
+            comment=state.get("comment", ""),
+            photos=state.get("photos", [])
         )
 
     request_id = state["request_id"]
@@ -1611,6 +1762,9 @@ def finalize_lead(user_id):
         details.append(f"🕒 Удобное время для связи: {state['contact_time']}")
     if state.get("comment"):
         details.append(f"💬 Комментарий клиента: {state['comment']}")
+    photo_tokens = parse_photo_tokens(json.dumps(state.get("photos", [])))
+    if photo_tokens:
+        details.append(f"📷 Фотографии объекта: {len(photo_tokens)} шт. (прикреплены ниже)")
     details_text = "\n".join(details)
     details_block = f"\n\n{details_text}" if details_text else ""
 
@@ -1627,7 +1781,7 @@ def finalize_lead(user_id):
 
     admin_notification_failed = False
     try:
-        notify_admin(admin_message)
+        notify_admin(admin_message, photo_tokens=photo_tokens)
     except Exception:
         admin_notification_failed = True
         logging.exception("Не удалось отправить заявку администратору")
@@ -1729,6 +1883,13 @@ def process_lead_message(user_id, text):
         advance_optional_lead_field(user_id, step)
         return
 
+    if step == "photos":
+        send_message(
+            user_id,
+            "Отправьте фотографию объекта или нажмите «Готово» / «Пропустить фотографии»."
+        )
+        return
+
     if step == "notify_retry":
         send_message(
             user_id,
@@ -1764,6 +1925,23 @@ def handle_button(user_id, payload):
     if payload.startswith("lead_skip:"):
         field = payload.split(":", 1)[1]
         skip_optional_lead_field(user_id, field)
+        return
+
+    if payload == "lead_photos_done":
+        state = lead_states.get(uid)
+        if not state or state.get("step") != "photos":
+            send_message(user_id, "Этап добавления фотографий уже завершён.")
+            return
+        finalize_lead(user_id)
+        return
+
+    if payload == "lead_skip_photos":
+        state = lead_states.get(uid)
+        if not state or state.get("step") != "photos":
+            send_message(user_id, "Этап добавления фотографий уже завершён.")
+            return
+        state["photos"] = []
+        finalize_lead(user_id)
         return
 
     if payload == "lead_retry_notification":
@@ -2212,7 +2390,9 @@ def handle_update(update):
     sender = message.get("sender", {})
     recipient = message.get("recipient", {})
     user_id = sender.get("user_id")
-    text = message.get("body", {}).get("text", "")
+    message_body = message.get("body") or {}
+    text = message_body.get("text", "")
+    attachments = message_body.get("attachments") or []
     text = str(text or "").strip()
 
     # Сообщения рабочей группы не должны попадать в личный сценарий клиента.
@@ -2248,6 +2428,19 @@ def handle_update(update):
         return
 
     uid = str(user_id)
+
+    # Во время шага фотографий изображения принимаются как вложения MAX.
+    lead_state = lead_states.get(uid)
+    if lead_state and lead_state.get("step") == "photos":
+        image_attachments = [
+            item for item in attachments
+            if isinstance(item, dict) and item.get("type") == "image"
+        ]
+        if image_attachments:
+            process_lead_photo_message(user_id, image_attachments)
+        else:
+            process_lead_message(user_id, text)
+        return
 
     # Поисковый запрос администратора обрабатываем до остальных текстовых сценариев.
     if uid in admin_search_states:
