@@ -103,6 +103,34 @@ GOOGLE_SHEET_ID = "1H9wwHnRb4-EWDrJPtd66U48miw9HfIuDZzP4krzyo3o"
 logging.info("База заказов и заявок: %s", DB_FILE)
 
 
+def connect_google_sheets():
+    try:
+        credentials_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+        if not credentials_json:
+            logging.error("Не задан GOOGLE_SERVICE_ACCOUNT_JSON")
+            return None
+
+        credentials_data = json.loads(credentials_json)
+
+        credentials = Credentials.from_service_account_info(
+            credentials_data,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets"
+            ]
+        )
+
+        client = gspread.authorize(credentials)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+
+        logging.info("Google Таблица успешно подключена")
+        return spreadsheet
+
+        except Exception:
+        logging.exception("Ошибка подключения Google Таблиц")
+        return None
+
+
 def init_history_db():
     with sqlite3.connect(DB_FILE) as connection:
         connection.execute("""
@@ -199,15 +227,42 @@ def is_admin(user_id):
 
 
 def save_customer_request(user_id, customer_name, phone, result):
+    created_at = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
+
     with sqlite3.connect(DB_FILE) as connection:
         cursor = connection.execute(
             "INSERT INTO customer_requests "
             "(user_id, created_at, customer_name, phone, result, status) "
             "VALUES (?, ?, ?, ?, ?, 'Новая')",
-            (str(user_id), datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M"),
-             customer_name, phone, result)
+            (str(user_id), created_at, customer_name, phone, result)
         )
-        return cursor.lastrowid
+        order_id = cursor.lastrowid
+
+    try:
+        spreadsheet = connect_google_sheets()
+        if spreadsheet:
+            worksheet = spreadsheet.worksheet("Активные заявки")
+            worksheet.append_row([
+                order_id,
+                created_at,
+                customer_name,
+                phone,
+                "",
+                result,
+                "",
+                "Новая",
+                "Активная"
+            ], value_input_option="USER_ENTERED")
+
+            logging.info("Заявка №%s добавлена в Google Таблицу", order_id)
+
+    except Exception:
+        logging.exception(
+            "Не удалось отправить заявку №%s в Google Таблицу",
+            order_id
+        )
+
+    return order_id
 
 
 def show_admin_panel(user_id):
