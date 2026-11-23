@@ -5,9 +5,12 @@ import ssl
 import hmac
 import hashlib
 import logging
+import math
 import threading
 import sqlite3
-from datetime import datetime
+import fcntl
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -43,9 +46,21 @@ if not re.fullmatch(r"[A-Za-z0-9_-]{5,256}", WEBHOOK_SECRET):
 
 API_URL = "https://platform-api2.max.ru"
 HEADERS = {"Authorization": TOKEN}
-WEBHOOK_URL = (
-    "https://bot-1794067708-7548-maksim-z.bothost.tech/webhook"
-)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+if not WEBHOOK_URL:
+    # Bothost передаёт WEBHOOK_URL при включённом домене; DOMAIN служит
+    # резервным источником, если WEBHOOK_URL не попал в окружение процесса.
+    domain = (os.getenv("DOMAIN") or "").strip().rstrip("/")
+    if domain:
+        if not domain.startswith(("http://", "https://")):
+            domain = f"https://{domain}"
+        WEBHOOK_URL = f"{domain}/webhook"
+if not WEBHOOK_URL:
+    raise RuntimeError(
+        "Не задан WEBHOOK_URL и не удалось определить URL из DOMAIN. "
+        "Проверьте включение домена Bothost."
+    )
+
 
 CA_FILE = Path(__file__).resolve().parent / "russian_trusted_sub_ca_2024.pem"
 
@@ -98,9 +113,35 @@ admin_search_states = set()
 # Постоянное хранилище Bothost
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+USER_STATE_LOCK_DIR = DATA_DIR / "user_state_locks"
+USER_STATE_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+GOOGLE_ORDER_LOCK_DIR = DATA_DIR / "google_order_locks"
+GOOGLE_ORDER_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+# Общая блокировка не позволяет очистке удалить lock-файл, который другой
+# поток уже открыл или ожидает открыть для блокировки.
+LOCK_MAINTENANCE_LOCK_FILE = DATA_DIR / "lock_maintenance.lock"
 DB_FILE = DATA_DIR / "orders_history.sqlite3"
-GOOGLE_SHEET_ID = "1H9wwHnRb4-EWDrJPtd66U48miw9HfIuDZzP4krzyo3o"
+# ID таблицы сохранён как резервное значение для бесшовного обновления
+# старой установки. В Bothost рекомендуется задать GOOGLE_SHEET_ID явно.
+DEFAULT_GOOGLE_SHEET_ID = "1H9wwHnRb4-EWDrJPtd66U48miw9HfIuDZzP4krzyo3o"
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID") or DEFAULT_GOOGLE_SHEET_ID
+if not os.getenv("GOOGLE_SHEET_ID"):
+    logging.warning(
+        "GOOGLE_SHEET_ID не задан; используется прежний ID таблицы из версии GitHub. "
+        "Добавьте GOOGLE_SHEET_ID в переменные Bothost."
+    )
+
 logging.info("База заказов и заявок: %s", DB_FILE)
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(DB_FILE, timeout=30.0)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 
 
 # Повторно используем одно подключение и объект таблицы в течение жизни процесса.
@@ -112,7 +153,34 @@ GOOGLE_SPREADSHEET_CACHE = None
 # повторяются с увеличивающейся паузой.
 GOOGLE_SYNC_LOCK = threading.RLock()
 GOOGLE_SYNC_RETRY_DELAYS = (5, 15)
-GOOGLE_SYNC_RETRY_INTERVAL = 60
+# SQLite используется как постоянная очередь: все заявки с google_synced=0 ожидают отправки.
+# Один фоновый работник проверяет очередь через заданный интервал; отдельные потоки на заявки не создаются.
+GOOGLE_SYNC_RETRY_INTERVAL = 10
+
+
+@contextmanager
+def lock_maintenance_shared():
+    """Не даёт очистке удалить файл блокировки во время его использования."""
+    with open(LOCK_MAINTENANCE_LOCK_FILE, "a", encoding="ascii") as guard_file:
+        fcntl.flock(guard_file.fileno(), fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(guard_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def locked_google_order(order_id):
+    """Блокирует запись одной заявки в Google между процессами Gunicorn."""
+    lock_path = GOOGLE_ORDER_LOCK_DIR / f"order_{int(order_id)}.lock"
+    with lock_maintenance_shared():
+        with open(lock_path, "a", encoding="ascii") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            os.utime(lock_path, None)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _is_retryable_google_error(error):
@@ -191,7 +259,10 @@ def connect_google_sheets():
 
 
 def init_history_db():
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
+        connection.execute("PRAGMA journal_mode=WAL;")
+       
+
         connection.execute("""
             CREATE TABLE IF NOT EXISTS order_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,6 +313,13 @@ def init_history_db():
                 "ALTER TABLE customer_requests "
                 "ADD COLUMN group_notified INTEGER NOT NULL DEFAULT 1"
             )
+        if "group_notification_claimed_at" not in columns:
+            # Время захвата позволяет вернуть в очередь уведомление,
+            # если процесс аварийно завершился до отправки в рабочую группу.
+            connection.execute(
+                "ALTER TABLE customer_requests "
+                "ADD COLUMN group_notification_claimed_at TEXT"
+            )
         if "photos" not in columns:
             # Храним переиспользуемые media-токены MAX, чтобы фото можно было
             # повторно отправить администратору и в рабочую группу.
@@ -256,6 +334,13 @@ def init_history_db():
                 "ALTER TABLE customer_requests "
                 "ADD COLUMN google_synced INTEGER NOT NULL DEFAULT 0"
             )
+        if "google_sync_version" not in columns:
+            # Версия увеличивается при каждом изменении данных, отправляемых в Google.
+            # Она не позволяет подтвердить доставку устаревшего снимка заявки.
+            connection.execute(
+                "ALTER TABLE customer_requests "
+                "ADD COLUMN google_sync_version INTEGER NOT NULL DEFAULT 0"
+            )
 
         connection.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
@@ -264,12 +349,25 @@ def init_history_db():
             )
         """)
 
+        # Состояния незавершённых диалогов хранятся отдельно от заявок и истории.
+        # Это позволяет восстановить расчёт или анкету после перезапуска приложения.
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS user_conversation_states (
+                user_id TEXT PRIMARY KEY,
+                order_state TEXT,
+                lead_state TEXT,
+                admin_search INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
         # Уже завершённые заявки переводим в архив при первом запуске новой версии.
         connection.execute(
             "UPDATE customer_requests "
             "SET archived = 1, "
             "archive_reason = COALESCE(archive_reason, 'Завершена'), "
-            "google_synced = 0 "
+            "google_synced = 0, "
+            "google_sync_version = google_sync_version + 1 "
             "WHERE status = 'Завершена' AND archived = 0"
         )
 
@@ -284,7 +382,7 @@ def init_history_db():
 
 
 def save_order_history(user_id, total, result):
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         connection.execute(
             "INSERT INTO order_history (user_id, created_at, total, result) "
             "VALUES (?, ?, ?, ?)",
@@ -293,7 +391,7 @@ def save_order_history(user_id, total, result):
 
 
 def show_order_history(user_id):
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         rows = connection.execute(
             "SELECT id, created_at, total FROM order_history "
             "WHERE user_id = ? ORDER BY id DESC LIMIT 10",
@@ -319,7 +417,7 @@ def show_order_history(user_id):
 
 
 def show_history_order(user_id, order_id):
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         row = connection.execute(
             "SELECT created_at, result FROM order_history "
             "WHERE id = ? AND user_id = ?",
@@ -340,6 +438,115 @@ def show_history_order(user_id, order_id):
 
 
 init_history_db()
+
+
+def _state_json_default(value):
+    """Сериализует set, не превращая его при восстановлении в обычный list."""
+    if isinstance(value, set):
+        return {"__maxbot_set__": sorted(value)}
+    raise TypeError(f"Неподдерживаемый тип состояния: {type(value).__name__}")
+
+
+def _state_json_object_hook(value):
+    marker = value.get("__maxbot_set__")
+    if len(value) == 1 and isinstance(marker, list):
+        return set(marker)
+    return value
+
+
+def load_user_conversation_state(user_id):
+    """Загружает состояние одного пользователя из SQLite в рабочие словари."""
+    uid = str(user_id)
+    order_states.pop(uid, None)
+    lead_states.pop(uid, None)
+    admin_search_states.discard(uid)
+
+    with get_db() as connection:
+        row = connection.execute(
+            "SELECT order_state, lead_state, admin_search "
+            "FROM user_conversation_states WHERE user_id = ?",
+            (uid,)
+        ).fetchone()
+
+    if not row:
+        return
+
+    order_json, lead_json, admin_search = row
+    if order_json:
+        order_states[uid] = json.loads(
+            order_json, object_hook=_state_json_object_hook
+        )
+    if lead_json:
+        lead_states[uid] = json.loads(
+            lead_json, object_hook=_state_json_object_hook
+        )
+    if admin_search:
+        admin_search_states.add(uid)
+
+
+def save_user_conversation_state(user_id):
+    """Сохраняет или удаляет состояние пользователя после обработки события."""
+    uid = str(user_id)
+    order_state = order_states.get(uid)
+    lead_state = lead_states.get(uid)
+    admin_search = 1 if uid in admin_search_states else 0
+
+    if order_state is None and lead_state is None and not admin_search:
+        with get_db() as connection:
+            connection.execute(
+                "DELETE FROM user_conversation_states WHERE user_id = ?",
+                (uid,)
+            )
+        return
+
+    order_json = (
+        json.dumps(order_state, ensure_ascii=False, default=_state_json_default)
+        if order_state is not None else None
+    )
+    lead_json = (
+        json.dumps(lead_state, ensure_ascii=False, default=_state_json_default)
+        if lead_state is not None else None
+    )
+
+    with get_db() as connection:
+        connection.execute(
+            "INSERT INTO user_conversation_states "
+            "(user_id, order_state, lead_state, admin_search, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "order_state = excluded.order_state, "
+            "lead_state = excluded.lead_state, "
+            "admin_search = excluded.admin_search, "
+            "updated_at = excluded.updated_at",
+            (
+                uid, order_json, lead_json, admin_search,
+                datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+            )
+        )
+
+
+@contextmanager
+def locked_user_conversation_state(user_id):
+    """Сериализует события одного пользователя между потоками и Gunicorn workers."""
+    uid = str(user_id)
+    lock_name = hashlib.sha256(uid.encode("utf-8")).hexdigest() + ".lock"
+    lock_path = USER_STATE_LOCK_DIR / lock_name
+
+    with lock_maintenance_shared():
+        with open(lock_path, "a", encoding="ascii") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            os.utime(lock_path, None)
+            # При ошибке чтения БД не сохраняем пустое состояние поверх прежнего.
+            load_user_conversation_state(uid)
+            try:
+                yield
+            finally:
+                try:
+                    # Сохраняем даже частично изменённое состояние, если обработчик
+                    # завершился ошибкой после изменения шага диалога.
+                    save_user_conversation_state(uid)
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def is_admin(user_id):
@@ -483,7 +690,7 @@ def extract_total_from_result(result):
 
 def _sync_request_to_google_once(order_id):
     """Выполняет одну попытку синхронизации заявки с Google Таблицей."""
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         row = connection.execute(
             "SELECT id, created_at, customer_name, phone, result, status, archived, "
             "address, locality, contact_time, comment, photos "
@@ -537,67 +744,89 @@ def _sync_request_to_google_once(order_id):
 
 
 def sync_request_to_google(order_id):
-    """Синхронизирует заявку с повторами и отмечает её доставленной."""
+    """Синхронизирует актуальную версию заявки и безопасно подтверждает доставку."""
     order_id = int(order_id)
+
+    # GOOGLE_SYNC_LOCK сохраняет прежнюю последовательность запросов Google внутри
+    # процесса, а locked_google_order дополнительно координирует разные workers.
     with GOOGLE_SYNC_LOCK:
-        # Если другой поток уже успел синхронизировать заявку, второй раз
-        # не обращаемся к Google API.
-        with sqlite3.connect(DB_FILE) as connection:
-            state = connection.execute(
-                "SELECT google_synced FROM customer_requests WHERE id = ?",
-                (order_id,)
-            ).fetchone()
+        with locked_google_order(order_id):
+            with get_db() as connection:
+                state = connection.execute(
+                    "SELECT google_synced, google_sync_version "
+                    "FROM customer_requests WHERE id = ?",
+                    (order_id,)
+                ).fetchone()
 
-        if not state:
-            return False
-        if state[0]:
-            return True
-
-        retry_delays = GOOGLE_SYNC_RETRY_DELAYS
-        for attempt in range(len(retry_delays) + 1):
-            try:
-                synced = _sync_request_to_google_once(order_id)
-                if not synced:
-                    return False
-
-                with sqlite3.connect(DB_FILE) as connection:
-                    connection.execute(
-                        "UPDATE customer_requests SET google_synced = 1 WHERE id = ?",
-                        (order_id,)
-                    )
-                logging.info("Заявка №%s синхронизирована с Google Таблицей", order_id)
+            if not state:
+                return False
+            if state[0]:
                 return True
 
-            except Exception as exc:
-                if not _is_retryable_google_error(exc) or attempt >= len(retry_delays):
-                    logging.exception(
-                        "Синхронизация заявки №%s не удалась после %s попыток",
-                        order_id, attempt + 1
-                    )
-                    return False
+            sync_version = state[1]
+            retry_delays = GOOGLE_SYNC_RETRY_DELAYS
+            for attempt in range(len(retry_delays) + 1):
+                try:
+                    synced = _sync_request_to_google_once(order_id)
+                    if not synced:
+                        return False
 
-                delay = _google_retry_delay(exc, retry_delays[attempt])
-                logging.warning(
-                    "Временная ошибка Google при синхронизации заявки №%s "
-                    "(попытка %s из %s). Повтор через %s сек.: %s",
-                    order_id, attempt + 1, len(retry_delays) + 1, delay, exc
-                )
-                time.sleep(delay)
+                    # Не ставим google_synced=1, если версия успела измениться
+                    # (например, из-за стороннего SQL-изменения без lock-файла).
+                    with get_db() as connection:
+                        cursor = connection.execute(
+                            "UPDATE customer_requests SET google_synced = 1 "
+                            "WHERE id = ? AND google_sync_version = ?",
+                            (order_id, sync_version)
+                        )
+                        marked = cursor.rowcount == 1
+
+                    if not marked:
+                        logging.warning(
+                            "Заявка №%s изменилась во время синхронизации; "
+                            "доставка не подтверждена и будет повторена",
+                            order_id
+                        )
+                        return False
+
+                    logging.info(
+                        "Заявка №%s синхронизирована с Google Таблицей "
+                        "(версия %s)",
+                        order_id, sync_version
+                    )
+                    return True
+
+                except Exception as exc:
+                    if (
+                        not _is_retryable_google_error(exc)
+                        or attempt >= len(retry_delays)
+                    ):
+                        logging.exception(
+                            "Синхронизация заявки №%s не удалась после %s попыток",
+                            order_id, attempt + 1
+                        )
+                        return False
+
+                    delay = _google_retry_delay(exc, retry_delays[attempt])
+                    logging.warning(
+                        "Временная ошибка Google при синхронизации заявки №%s "
+                        "(попытка %s из %s). Повтор через %s сек.: %s",
+                        order_id, attempt + 1, len(retry_delays) + 1, delay, exc
+                    )
+                    time.sleep(delay)
 
     return False
 
-
 def sync_all_requests_to_google():
-    """Синхронизирует только заявки, которые ещё не подтверждены Google."""
+    """Обрабатывает элементы постоянной SQLite-очереди (google_synced=0)."""
     try:
-        with sqlite3.connect(DB_FILE) as connection:
+        with get_db() as connection:
             rows = connection.execute(
                 "SELECT id FROM customer_requests "
                 "WHERE google_synced = 0 ORDER BY id"
             ).fetchall()
 
         if not rows:
-            logging.info("Нет заявок для синхронизации с Google Таблицей")
             return
 
         synced = 0
@@ -622,24 +851,83 @@ def sync_all_requests_to_google():
         logging.exception("Не удалось выполнить сверку заявок с Google Таблицей")
 
 
-def google_sync_retry_worker():
-    """Повторяет доставку всех несинхронизированных заявок каждые 60 секунд."""
-    sync_all_requests_to_google()
-    while True:
-        time.sleep(GOOGLE_SYNC_RETRY_INTERVAL)
+def cleanup_old_user_states_and_lock_files():
+    """Удаляет состояния старше 7 дней и неиспользуемые старые lock-файлы."""
+    cutoff_dt = datetime.now(MOSCOW_TZ) - timedelta(days=7)
+    cutoff_iso = cutoff_dt.isoformat(timespec="seconds")
+    cutoff_timestamp = time.time() - 7 * 24 * 60 * 60
+    removed_states = 0
+    removed_lock_files = 0
+
+    # Эксклюзивная общая блокировка гарантирует, что ни один поток не держит
+    # и не ожидает открытия индивидуального lock-файла во время очистки.
+    with open(LOCK_MAINTENANCE_LOCK_FILE, "a", encoding="ascii") as guard_file:
+        fcntl.flock(guard_file.fileno(), fcntl.LOCK_EX)
         try:
-            with sqlite3.connect(DB_FILE) as connection:
-                pending_count = connection.execute(
-                    "SELECT COUNT(*) FROM customer_requests WHERE google_synced = 0"
-                ).fetchone()[0]
-            if pending_count:
-                logging.info(
-                    "Повторная фоновая синхронизация: ожидают отправки %s заявок",
-                    pending_count
+            with get_db() as connection:
+                cursor = connection.execute(
+                    "DELETE FROM user_conversation_states WHERE updated_at < ?",
+                    (cutoff_iso,)
                 )
-                sync_all_requests_to_google()
+                removed_states = cursor.rowcount
+
+            for lock_dir in (USER_STATE_LOCK_DIR, GOOGLE_ORDER_LOCK_DIR):
+                for lock_path in lock_dir.glob("*.lock"):
+                    try:
+                        if lock_path.stat().st_mtime >= cutoff_timestamp:
+                            continue
+
+                        with open(lock_path, "a", encoding="ascii") as lock_file:
+                            try:
+                                fcntl.flock(
+                                    lock_file.fileno(),
+                                    fcntl.LOCK_EX | fcntl.LOCK_NB
+                                )
+                            except BlockingIOError:
+                                continue
+
+                            # Повторно проверяем возраст непосредственно перед удалением.
+                            if lock_path.exists() and lock_path.stat().st_mtime < cutoff_timestamp:
+                                lock_path.unlink()
+                                removed_lock_files += 1
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    except FileNotFoundError:
+                        continue
+                    except Exception:
+                        logging.exception("Не удалось очистить lock-файл %s", lock_path)
+
+        finally:
+            fcntl.flock(guard_file.fileno(), fcntl.LOCK_UN)
+
+    logging.info(
+        "Очистка старых данных завершена: состояний удалено %s, lock-файлов удалено %s",
+        removed_states, removed_lock_files
+    )
+
+
+def google_sync_queue_worker():
+    """Единственный постоянный работник SQLite-очереди Google Sheets.
+
+    Очередь переживает перезапуск: её элементы — заявки с google_synced=0.
+    Ошибочные записи не удаляются и будут подобраны на следующем проходе.
+    """
+    logging.info(
+        "Запущен постоянный работник очереди Google Sheets; интервал опроса %s сек.",
+        GOOGLE_SYNC_RETRY_INTERVAL
+    )
+
+    # Сразу подбираем заявки, оставшиеся в очереди до перезапуска приложения.
+    last_cleanup = 0.0
+    while True:
+        try:
+            if time.monotonic() - last_cleanup >= 24 * 60 * 60:
+                cleanup_old_user_states_and_lock_files()
+                last_cleanup = time.monotonic()
+            sync_all_requests_to_google()
         except Exception:
-            logging.exception("Ошибка фоновой повторной синхронизации Google Таблиц")
+            logging.exception("Ошибка фонового работника очереди Google Sheets")
+
+        time.sleep(GOOGLE_SYNC_RETRY_INTERVAL)
 
 
 def save_customer_request(
@@ -648,7 +936,7 @@ def save_customer_request(
 ):
     created_at = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
 
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         cursor = connection.execute(
             "INSERT INTO customer_requests "
             "(user_id, created_at, customer_name, phone, result, status, "
@@ -662,19 +950,11 @@ def save_customer_request(
         )
         order_id = cursor.lastrowid
 
-    try:
-        synced = sync_request_to_google(order_id)
-        if synced:
-            logging.info("Заявка №%s синхронизирована с Google Таблицей", order_id)
-        else:
-            logging.warning("Заявка №%s сохранена в SQLite, но Google Таблица пока не обновлена", order_id)
-    except Exception:
-        logging.exception(
-            "Не удалось синхронизировать заявку №%s с Google Таблицей",
-            order_id
-        )
-
+    # Новая заявка автоматически попадает в постоянную очередь Google Sheets:
+    # google_synced по умолчанию равен 0. Отдельный поток на заявку не создаём.
     return order_id
+
+
 
 
 def show_admin_panel(user_id):
@@ -682,7 +962,7 @@ def show_admin_panel(user_id):
         send_message(user_id, "⛔ Доступ запрещён.")
         return
 
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         total = connection.execute(
             "SELECT COUNT(*) FROM customer_requests"
         ).fetchone()[0]
@@ -737,7 +1017,7 @@ def show_admin_orders(user_id, only_new=False, status=None, search_term=None):
         "FROM customer_requests WHERE " + " AND ".join(conditions) +
         " ORDER BY id DESC"
     )
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         rows = connection.execute(query, params).fetchall()
 
     if search_term:
@@ -801,7 +1081,7 @@ def show_admin_archive(user_id, only_completed=False):
         params.append("Завершена")
     query += " ORDER BY id DESC LIMIT 20"
 
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         rows = connection.execute(query, params).fetchall()
 
     title = "✅ ЗАВЕРШЁННЫЕ ЗАЯВКИ" if only_completed else "🗃 АРХИВ ЗАЯВОК"
@@ -861,7 +1141,7 @@ def show_admin_order(user_id, order_id, from_archive=False):
     if not is_admin(user_id):
         send_message(user_id, "⛔ Доступ запрещён.")
         return
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         row = connection.execute(
             "SELECT user_id, created_at, customer_name, phone, result, status, "
             "archived, archive_reason, address, locality, contact_time, comment, photos "
@@ -929,14 +1209,20 @@ def set_admin_order_status(user_id, order_id, status):
         send_message(user_id, "Недопустимый статус.")
         return
 
+    order_id = int(order_id)
     is_archived = 1 if status == "Завершена" else 0
     archive_reason = "Завершена" if is_archived else None
-    with sqlite3.connect(DB_FILE) as connection:
+    # Не ждём сетевой операции Google в обработчике кнопки администратора.
+    # Версия атомарно помечает старый снимок как устаревший; новый запуск
+    # синхронизации после этого обновления отправит уже актуальное состояние.
+    with get_db() as connection:
         cursor = connection.execute(
             "UPDATE customer_requests "
-            "SET status = ?, archived = ?, archive_reason = ?, google_synced = 0 "
+            "SET status = ?, archived = ?, archive_reason = ?, "
+            "google_synced = 0, "
+            "google_sync_version = google_sync_version + 1 "
             "WHERE id = ?",
-            (status, is_archived, archive_reason, int(order_id))
+            (status, is_archived, archive_reason, order_id)
         )
         found = cursor.rowcount > 0
 
@@ -944,10 +1230,8 @@ def set_admin_order_status(user_id, order_id, status):
         send_message(user_id, "Заявка не найдена.")
         return
 
-    try:
-        sync_request_to_google(order_id)
-    except Exception:
-        logging.exception("Не удалось синхронизировать заявку №%s с Google Таблицей", order_id)
+    # google_synced=0 и новая google_sync_version ставят изменение в очередь.
+    # Постоянный работник отправит актуальный снимок заявки.
 
     if is_archived:
         send_message(user_id, f"✅ Заявка №{order_id} завершена и перемещена в архив.")
@@ -1008,6 +1292,13 @@ EXTRAS = {
 # =========================================================
 
 def send_message(user_id, text, buttons=None, photo_tokens=None):
+    text = str(text or "")
+    if len(text) > 3900:
+        text = text[:3800] + (
+            "\n\n… Текст сокращён из-за ограничения длины сообщения. "
+            "Полные данные сохранены в базе бота."
+        )
+
     body = {"text": text}
     attachments = [
         {"type": "image", "payload": {"token": token}}
@@ -1031,7 +1322,7 @@ def send_message(user_id, text, buttons=None, photo_tokens=None):
         timeout=20
     )
 
-    logging.info(
+    logging.debug(
         "Ответ MAX: %s %s",
         response.status_code,
         response.text
@@ -1059,7 +1350,7 @@ GROUP_NOTIFICATIONS_LOCK = threading.Lock()
 
 
 def get_work_group_chat_id():
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         row = connection.execute(
             "SELECT setting_value FROM bot_settings WHERE setting_key = ?",
             ("work_group_chat_id",)
@@ -1068,7 +1359,7 @@ def get_work_group_chat_id():
 
 
 def set_work_group_chat_id(chat_id):
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         connection.execute(
             "INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?) "
             "ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value",
@@ -1077,7 +1368,7 @@ def set_work_group_chat_id(chat_id):
 
 
 def clear_work_group_chat_id(chat_id):
-    with sqlite3.connect(DB_FILE) as connection:
+    with get_db() as connection:
         connection.execute(
             "DELETE FROM bot_settings WHERE setting_key = ? AND setting_value = ?",
             ("work_group_chat_id", str(chat_id))
@@ -1140,14 +1431,26 @@ def format_group_request(row):
 
 
 def sync_pending_group_notifications():
-    """Отправляет в рабочую группу новые заявки, ещё не отмеченные как доставленные."""
+    """Атомарно забирает и отправляет ожидающие уведомления в рабочую группу."""
     chat_id = get_work_group_chat_id()
     if not chat_id:
         return
 
-    # Не допускаем параллельной отправки одной очереди из разных потоков.
     with GROUP_NOTIFICATIONS_LOCK:
-        with sqlite3.connect(DB_FILE) as connection:
+        # Возвращаем зависшие захваты в очередь. Тайм-аут значительно больше
+        # сетевого тайм-аута запроса MAX, поэтому активная отправка не прерывается.
+        stale_claim_before = (
+            datetime.now(MOSCOW_TZ) - timedelta(minutes=15)
+        ).isoformat(timespec="seconds")
+        with get_db() as connection:
+            connection.execute(
+                "UPDATE customer_requests "
+                "SET group_notified = 0, group_notification_claimed_at = NULL "
+                "WHERE group_notified = 1 "
+                "AND group_notification_claimed_at IS NOT NULL "
+                "AND group_notification_claimed_at < ?",
+                (stale_claim_before,)
+            )
             rows = connection.execute(
                 "SELECT id, created_at, customer_name, phone, result, address, "
                 "locality, contact_time, comment, photos "
@@ -1156,6 +1459,21 @@ def sync_pending_group_notifications():
 
         for row in rows:
             order_id = row[0]
+            claim_timestamp = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+
+            # Уведомление атомарно захватывается только одним процессом.
+            with get_db() as connection:
+                cursor = connection.execute(
+                    "UPDATE customer_requests "
+                    "SET group_notified = 1, group_notification_claimed_at = ? "
+                    "WHERE id = ? AND group_notified = 0",
+                    (claim_timestamp, order_id)
+                )
+                claimed = cursor.rowcount == 1
+
+            if not claimed:
+                continue
+
             try:
                 send_group_message(
                     chat_id,
@@ -1163,21 +1481,54 @@ def sync_pending_group_notifications():
                     photo_tokens=parse_photo_tokens(row[9])
                 )
             except Exception:
+                # Возвращаем заявку в очередь. Цикл останавливается, чтобы
+                # сохранить исходный порядок и не перегружать MAX повторными запросами.
+                with get_db() as connection:
+                    connection.execute(
+                        "UPDATE customer_requests "
+                        "SET group_notified = 0, group_notification_claimed_at = NULL "
+                        "WHERE id = ? AND group_notified = 1 "
+                        "AND group_notification_claimed_at = ?",
+                        (order_id, claim_timestamp)
+                    )
                 logging.exception(
-                    "Не удалось отправить заявку №%s в рабочую группу; она останется в очереди",
+                    "Не удалось отправить заявку №%s в рабочую группу; "
+                    "она возвращена в очередь",
                     order_id
                 )
                 break
+            else:
+                # Успешная отправка завершает захват; сохраняем только признак доставки.
+                with get_db() as connection:
+                    connection.execute(
+                        "UPDATE customer_requests "
+                        "SET group_notification_claimed_at = NULL "
+                        "WHERE id = ? AND group_notified = 1 "
+                        "AND group_notification_claimed_at = ?",
+                        (order_id, claim_timestamp)
+                    )
 
-            with sqlite3.connect(DB_FILE) as connection:
-                connection.execute(
-                    "UPDATE customer_requests SET group_notified = 1 "
-                    "WHERE id = ? AND group_notified = 0",
-                    (order_id,)
-                )
             # Документация MAX ограничивает отправку двумя сообщениями в секунду в один чат.
             if len(rows) > 1:
                 time.sleep(0.55)
+
+
+def group_notification_queue_worker():
+    """Единый постоянный работник доставки заявок в рабочую группу MAX."""
+    interval = 10
+    logging.info(
+        "Запущен постоянный работник очереди уведомлений рабочей группы; "
+        "интервал опроса %s сек.",
+        interval
+    )
+    while True:
+        try:
+            sync_pending_group_notifications()
+        except Exception:
+            logging.exception(
+                "Ошибка фонового работника очереди уведомлений рабочей группы"
+            )
+        time.sleep(interval)
 
 
 def keyboard(items, columns=2):
@@ -1199,6 +1550,9 @@ def keyboard(items, columns=2):
 def clear_user_data(uid):
     order_states.pop(uid, None)
     lead_states.pop(uid, None)
+    # Поиск администратора тоже является частью состояния диалога.
+    # Убираем его при возврате в главное меню или отмене сценария.
+    admin_search_states.discard(str(uid))
 
 
 
@@ -1624,6 +1978,13 @@ def calculate_order(user_id):
 
     total = drilling_subtotal + extra_total
 
+    # Дублируем общую сумму в начале сметы: она останется видна,
+    # даже если длинное сообщение будет сокращено перед отправкой в MAX.
+    lines[2:2] = [
+        f"💰 ОБЩАЯ СТОИМОСТЬ ЗАКАЗА: {total:.2f} ₽",
+        ""
+    ]
+
     lines.append(f"💎 ИТОГО БУРЕНИЕ: {drilling_subtotal:.2f} ₽")
 
     if extra_lines:
@@ -1959,12 +2320,9 @@ def finalize_lead(user_id):
             }]]
         )
 
-    # Групповое уведомление отправляется независимо от личного уведомления.
-    # Если группа ещё не привязана или MAX временно недоступен, заявка остаётся в очереди.
-    try:
-        sync_pending_group_notifications()
-    except Exception:
-        logging.exception("Ошибка отправки новых заявок в рабочую группу")
+    # Групповые уведомления доставляет единый постоянный работник очереди.
+    # Отдельный поток на каждую заявку не создаём: это исключает дубли
+    # при нескольких Gunicorn workers и сохраняет очередь в SQLite.
 
     if admin_notification_failed:
         return
@@ -2175,7 +2533,7 @@ def handle_button(user_id, payload):
             send_message(user_id, "Некорректный номер заявки.")
             return
 
-        with sqlite3.connect(DB_FILE) as connection:
+        with get_db() as connection:
             row = connection.execute(
                 "SELECT id, customer_name FROM customer_requests WHERE id = ?",
                 (order_id,)
@@ -2226,26 +2584,23 @@ def handle_button(user_id, payload):
             send_message(user_id, "Некорректный номер заявки.")
             return
 
-        with sqlite3.connect(DB_FILE) as connection:
+        # Как и при смене статуса, обновляем SQLite немедленно, не ожидая Google.
+        with get_db() as connection:
             cursor = connection.execute(
                 "UPDATE customer_requests "
                 "SET archived = 1, "
                 "archive_reason = 'Перемещена администратором в архив', "
-                "google_synced = 0 "
+                "google_synced = 0, "
+                "google_sync_version = google_sync_version + 1 "
                 "WHERE id = ? AND archived = 0",
                 (order_id,)
             )
             found = cursor.rowcount > 0
 
         if found:
-            try:
-                sync_request_to_google(order_id)
-            except Exception:
-                logging.exception(
-                    "Не удалось синхронизировать архивирование заявки №%s",
-                    order_id
-                )
+            # Изменение уже отмечено как ожидающее синхронизации в SQLite.
             send_message(user_id, f"🗃 Заявка №{order_id} перемещена в архив. Данные сохранены.")
+
             show_admin_panel(user_id)
         else:
             send_message(user_id, "Активная заявка не найдена.")
@@ -2510,7 +2865,7 @@ def handle_button(user_id, payload):
 # ОБРАБОТКА СОБЫТИЙ MAX
 # =========================================================
 
-def handle_update(update):
+def _handle_update(update):
     update_type = update.get("update_type")
     logging.info("Получено событие MAX: %s", update_type)
 
@@ -2579,8 +2934,11 @@ def handle_update(update):
                     "Новые заявки будут автоматически появляться здесь."
                 )
                 set_work_group_chat_id(chat_id)
-                logging.info("Рабочая группа успешно привязана: chat_id=%s", chat_id)
-                sync_pending_group_notifications()
+                logging.info(
+                    "Рабочая группа успешно привязана: chat_id=%s. "
+                    "Ожидающие уведомления заберёт фоновая очередь.",
+                    chat_id
+                )
             except Exception:
                 logging.exception("Не удалось подключить рабочую группу chat_id=%s", chat_id)
         return
@@ -2617,9 +2975,9 @@ def handle_update(update):
 
         if step == "depth":
             try:
-                depth = float(text.replace(",", "."))
+                depth = float(text.replace(",", ".").strip())
 
-                if depth <= 0 or depth > 500:
+                if not math.isfinite(depth) or depth <= 0 or depth > 500:
                     raise ValueError
 
                 state["current"]["depth"] = depth
@@ -2636,6 +2994,8 @@ def handle_update(update):
 
         if step == "quantity":
             try:
+                if not re.fullmatch(r"[0-9]+", text):
+                    raise ValueError
                 quantity = int(text)
 
                 if quantity <= 0 or quantity > 100000:
@@ -2652,6 +3012,16 @@ def handle_update(update):
                     "Например: 5"
                 )
 
+            return
+
+        # На шагах, где клиент выбирает параметры кнопками, случайный текст
+        # не должен сбрасывать незавершённый черновик заказа.
+        if not step:
+            send_message(
+                user_id,
+                "Пожалуйста, выберите действие с помощью кнопок выше "
+                "или нажмите «Отмена заказа»."
+            )
             return
 
     # Затем обрабатываем имя, телефон и необязательные поля заявки.
@@ -2675,6 +3045,34 @@ def handle_update(update):
     # Если пользователь написал произвольный текст вне сценария,
     # показываем главное меню.
     main_menu(user_id)
+
+def _user_id_from_update(update):
+    """Извлекает пользователя из поддерживаемых личных событий MAX."""
+    update_type = update.get("update_type")
+
+    if update_type == "bot_started":
+        return (update.get("user") or {}).get("user_id")
+
+    if update_type == "message_callback":
+        callback = update.get("callback") or {}
+        return (callback.get("user") or {}).get("user_id")
+
+    if update_type == "message_created":
+        message = update.get("message") or {}
+        return (message.get("sender") or {}).get("user_id")
+
+    return None
+
+
+def handle_update(update):
+    """Обрабатывает событие с восстановлением состояния пользователя из SQLite."""
+    user_id = _user_id_from_update(update)
+    if user_id is None:
+        return _handle_update(update)
+
+    with locked_user_conversation_state(user_id):
+        return _handle_update(update)
+
 
 # =========================================================
 # FLASK WEBHOOK
@@ -2714,8 +3112,6 @@ def webhook():
 # =========================================================
 
 def register_webhook():
-    time.sleep(3)
-
     payload = {
         "url": WEBHOOK_URL,
         "update_types": [
@@ -2728,54 +3124,97 @@ def register_webhook():
         "secret": WEBHOOK_SECRET
     }
 
-    try:
-        response = session.post(
-            f"{API_URL}/subscriptions",
-            headers=HEADERS,
-            json=payload,
-            timeout=20
-        )
+    # Пять попыток; паузы применяются между попытками, а не перед первой.
+    retry_delays = (3, 5, 10, 20)
+    total_attempts = len(retry_delays) + 1
+    for attempt in range(1, total_attempts + 1):
+        if attempt > 1:
+            time.sleep(retry_delays[attempt - 2])
+        try:
+            response = session.post(
+                f"{API_URL}/subscriptions",
+                headers=HEADERS,
+                json=payload,
+                timeout=20
+            )
+            response.raise_for_status()
 
-        logging.info(
-            "Регистрация Webhook: %s %s",
-            response.status_code,
-            response.text
-        )
-        response.raise_for_status()
+            try:
+                result = response.json()
+            except ValueError as exc:
+                raise RuntimeError("MAX вернул некорректный JSON при регистрации Webhook") from exc
 
-        if response.json().get("success"):
-            logging.info("Webhook успешно зарегистрирован")
+            if not isinstance(result, dict) or result.get("success") is not True:
+                raise RuntimeError(
+                    "MAX не подтвердил регистрацию Webhook: "
+                    f"{result!r}"
+                )
 
-    except Exception:
-        logging.exception("Не удалось зарегистрировать Webhook")
+            logging.debug(
+                "Ответ регистрации Webhook MAX: %s %s",
+                response.status_code,
+                response.text
+            )
+            logging.info(
+                "Webhook успешно зарегистрирован (попытка %s из %s)",
+                attempt, total_attempts
+            )
+            return True
 
+        except Exception as exc:
+            logging.warning(
+                "Попытка регистрации Webhook %s из %s не удалась: %s",
+                attempt, total_attempts, exc
+            )
+
+    logging.error(
+        "Webhook не удалось зарегистрировать после %s попыток. "
+        "Проверьте доступность MAX API и повторите запуск.",
+        total_attempts
+    )
+    return False
+
+
+_WORKER_LOCK_FILE = None
+_BACKGROUND_START_LOCK = threading.Lock()
+
+
+def start_background_workers():
+    """Стартует фоновые потоки только после fork, в первом запросившем worker."""
+    global _WORKER_LOCK_FILE
+
+    if _WORKER_LOCK_FILE is not None:
+        return
+
+    with _BACKGROUND_START_LOCK:
+        if _WORKER_LOCK_FILE is not None:
+            return
+
+        lock_path = DATA_DIR / "background_workers.lock"
+        # Режим append не обнуляет lock-файл при параллельном открытии процессами.
+        lock_file = open(lock_path, "a", encoding="ascii")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_file.close()
+            return
+
+        # Сохраняем дескриптор: flock удерживается всё время жизни worker-процесса.
+        _WORKER_LOCK_FILE = lock_file
+        logging.info("Этот процесс получил блокировку фоновых работников")
+
+        threading.Thread(target=register_webhook, daemon=True).start()
+        threading.Thread(target=google_sync_queue_worker, daemon=True).start()
+        threading.Thread(target=group_notification_queue_worker, daemon=True).start()
+
+
+@app.before_request
+def ensure_background_workers_started():
+    # Важно для Gunicorn: не запускать потоки при импорте/preload до fork.
+    start_background_workers()
 
 if __name__ == "__main__":
     PORT = int(os.getenv("PORT", "3000"))
-
-    logging.info(
-        "Запускаем Webhook-сервер на порту %s",
-        PORT
-    )
-
-    threading.Thread(
-        target=register_webhook,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=google_sync_retry_worker,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=sync_pending_group_notifications,
-        daemon=True
-    ).start()
-
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        threaded=True
-    )
-    
+    logging.info("Запускаем Webhook-сервер на порту %s", PORT)
+    start_background_workers()
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
